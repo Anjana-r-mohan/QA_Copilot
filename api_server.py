@@ -6,12 +6,14 @@ REST API for use in IntelliJ or any IDE
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import os
 import sys
 import shutil
+import json
+import asyncio
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -446,6 +448,97 @@ async def execute_test_plan(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/navigate-ui-stream")
+async def navigate_ui_stream_endpoint(request: dict):
+    """
+    Stream navigation progress with real-time updates
+    Returns Server-Sent Events (SSE) stream
+    """
+    command = request.get('command')
+    device_name = request.get('device_name', '127.0.0.1:6555')
+    app_package = request.get('app_package', None)
+    app_activity = request.get('app_activity', None)
+    workspace_path = request.get('workspace_path', os.getcwd())
+    
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    
+    async def generate_progress():
+        """Generate SSE stream with progress updates"""
+        try:
+            # Send initial understanding
+            yield f"data: {json.dumps({'type': 'understanding', 'message': f'🎯 I understand: {command}'})}\n\n"
+            
+            # Detect intent
+            user_command_lower = command.lower()
+            has_test_plan = any(kw in user_command_lower for kw in ['test plan', 'test case'])
+            
+            if has_test_plan:
+                yield f"data: {json.dumps({'type': 'intent', 'message': '📋 Detected: Test Plan Execution Mode'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'intent', 'message': '🧭 Detected: Free-form Navigation Mode'})}\n\n"
+            
+            # Create progress callback
+            def send_progress(msg_type: str, message: str, data: dict = None):
+                event = {'type': msg_type, 'message': message}
+                if data:
+                    event.update(data)
+                # Store in queue for async iteration
+                progress_queue.put(json.dumps(event))
+            
+            # Execute with progress callback
+            import queue
+            progress_queue = queue.Queue()
+            
+            # Run navigation in thread to allow async streaming
+            import threading
+            result_container = {}
+            
+            def run_navigation():
+                try:
+                    result = ui_explorer.navigate_based_on_intent_with_progress(
+                        user_command=command,
+                        device_name=device_name,
+                        app_package=app_package,
+                        app_activity=app_activity,
+                        workspace_path=workspace_path,
+                        progress_callback=send_progress
+                    )
+                    result_container['result'] = result
+                    progress_queue.put(None)  # Signal completion
+                except Exception as e:
+                    result_container['error'] = str(e)
+                    progress_queue.put(None)
+            
+            nav_thread = threading.Thread(target=run_navigation)
+            nav_thread.start()
+            
+            # Stream progress updates
+            while True:
+                try:
+                    msg = progress_queue.get(timeout=1.0)
+                    if msg is None:  # Completion signal
+                        break
+                    yield f"data: {msg}\n\n"
+                except queue.Empty:
+                    # Send keepalive
+                    yield f"data: {json.dumps({'type': 'keepalive', 'message': '⏳ Processing...'})}\n\n"
+            
+            # Wait for thread to complete
+            nav_thread.join(timeout=10)
+            
+            # Send final result
+            if 'result' in result_container:
+                yield f"data: {json.dumps({'type': 'complete', 'result': result_container['result']})}\n\n"
+            elif 'error' in result_container:
+                yield f"data: {json.dumps({'type': 'error', 'message': result_container['error']})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'❌ {str(e)}'})}\n\n"
+    
+    return StreamingResponse(generate_progress(), media_type="text/event-stream")
+
+
 @app.post("/api/navigate-ui")
 async def navigate_ui(request: dict):
     """
@@ -458,7 +551,8 @@ async def navigate_ui(request: dict):
         "device_name": "127.0.0.1:6555",
         "app_package": "co.bizom.apps",
         "app_activity": ".android.MainActivity",
-        "workspace_path": "/path/to/workspace"
+        "workspace_path": "/path/to/workspace",
+        "stream": false  // Set to true for SSE streaming
     }
     """
     try:
@@ -467,11 +561,19 @@ async def navigate_ui(request: dict):
         app_package = request.get('app_package', None)
         app_activity = request.get('app_activity', None)
         workspace_path = request.get('workspace_path', os.getcwd())
+        stream = request.get('stream', False)
         
         if not command:
             raise HTTPException(status_code=400, detail="command is required")
         
-        # Try to use UI Explorer agent's intelligent navigation
+        # If streaming requested, use SSE endpoint
+        if stream:
+            return StreamingResponse(
+                navigate_ui_stream(command, device_name, app_package, app_activity, workspace_path),
+                media_type="text/event-stream"
+            )
+        
+        # Original non-streaming behavior
         try:
             result = ui_explorer.navigate_based_on_intent(
                 user_command=command,
@@ -508,6 +610,46 @@ async def navigate_ui(request: dict):
         import traceback
         error_detail = f"{str(e)}\n{traceback.format_exc()}"
         raise HTTPException(status_code=500, detail=error_detail)
+
+
+async def navigate_ui_stream(command: str, device_name: str, app_package: str, 
+                             app_activity: str, workspace_path: str):
+    """
+    Stream navigation progress using Server-Sent Events (SSE)
+    Sends real-time updates as execution progresses
+    """
+    try:
+        # Send initial acknowledgment
+        yield f"data: {json.dumps({'type': 'start', 'message': f'🎯 Understanding your command: {command}'})}\n\n"
+        await asyncio.sleep(0.1)
+        
+        # Create progress callback
+        async def progress_callback(update_type: str, message: str, data: dict = None):
+            event_data = {
+                'type': update_type,
+                'message': message
+            }
+            if data:
+                event_data.update(data)
+            yield f"data: {json.dumps(event_data)}\n\n"
+            await asyncio.sleep(0.1)
+        
+        # Execute with progress updates
+        result = ui_explorer.navigate_based_on_intent(
+            user_command=command,
+            device_name=device_name,
+            app_package=app_package,
+            app_activity=app_activity,
+            workspace_path=workspace_path,
+            progress_callback=progress_callback
+        )
+        
+        # Send final result
+        yield f"data: {json.dumps({'type': 'complete', 'result': result})}\n\n"
+        
+    except Exception as e:
+        error_msg = str(e)
+        yield f"data: {json.dumps({'type': 'error', 'message': f'❌ Error: {error_msg}'})}\n\n"
 
 
 @app.post("/api/execute-test-plan-with-ai")

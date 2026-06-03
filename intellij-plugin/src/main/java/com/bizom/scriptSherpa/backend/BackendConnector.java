@@ -1,4 +1,4 @@
-package com.bizom.qaCopilot.backend;
+package com.bizom.scriptSherpa.backend;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;

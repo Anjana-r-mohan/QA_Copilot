@@ -1,0 +1,129 @@
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                                                                              ║
+║                   🎯 INSTALL SCRIPTSHERPA - QUICK GUIDE                     ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+📦 PLUGIN FILE READY
+
+Name: ScriptSherpa
+File: script-sherpa.zip
+Location: /Users/anjana.mohan/QaCoPilot/intellij-plugin/build/distributions/script-sherpa.zip
+Size: 3.0 MB
+Status: ✅ READY TO INSTALL
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🚀 INSTALLATION (3 STEPS)
+
+1. Open IntelliJ IDEA
+   File → Settings → Plugins
+
+2. Install Plugin
+   ⚙️ (gear icon) → Install Plugin from Disk
+   
+3. Select File
+   Navigate to: /Users/anjana.mohan/QaCoPilot/intellij-plugin/build/distributions/
+   Select: script-sherpa.zip
+   Click OK → Restart IntelliJ
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+✨ AFTER RESTART
+
+Look for: "ScriptSherpa" tool window (right sidebar)
+Click to open
+You'll see:
+  📋 Test Plan    📄 CSV
+  [Chat area]
+  [Input box]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 FIRST TEST
+
+1. Click 📋 Test Plan
+2. Select: /Users/anjana.mohan/KMMAuto_demo/test_plans/test_plan_TestCases_27-05-26-14_09_48.md
+3. Type: explore the page as per test plan and get locators
+4. Click Send
+5. WATCH THE MAGIC! ✨
+
+You'll see REAL-TIME updates:
+
+🎯 I understand: explore the page as per test plan...
+📋 Detected: Test Plan Execution Mode
+📋 Parsing test plan...
+✅ Found 10 test cases
+📱 Connecting to device...
+✅ Connected!
+📝 Executing TC8508 (1/10)
+   Step 1/8: Open app...
+   Found 81 elements
+   ✅ Added 81 locators (total: 81)
+   
+   Step 2/8: Navigate...
+   Found 79 elements
+   ✅ Added 5 locators (total: 86)
+   [76 duplicates skipped]
+
+... continues for all 10 test cases ...
+
+✅ Complete! 150 locators collected
+Saved to: /Users/anjana.mohan/KMMAuto_demo/locators/...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🌟 KEY FEATURES
+
+✅ Real-Time Streaming - See progress as it happens
+✅ No Timeouts - Connection stays alive
+✅ Full Visibility - Know exactly what's happening
+✅ Professional UX - Modern AI tool experience
+✅ Smart Deduplication - One consolidated file
+✅ Comprehensive Data - 50-150+ locators per test plan
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🔧 VERIFY BEFORE TESTING
+
+Required:
+□ API Server running: curl http://localhost:8000/health
+□ Device connected: adb devices (should show 127.0.0.1:6555)
+□ Appium running: lsof -i :4723
+□ Device unlocked and app visible
+□ IntelliJ restarted after plugin install
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❓ IF SOMETHING'S WRONG
+
+Plugin not visible?
+  → Restart IntelliJ again
+  → Check Settings → Plugins → "ScriptSherpa" is enabled
+
+No streaming updates?
+  → Restart API server:
+    ps aux | grep api_server.py
+    kill -9 <PID>
+    python3 /Users/anjana.mohan/QaCoPilot/api_server.py &
+
+Timeout errors?
+  → Make sure using ScriptSherpa (not old QA Copilot)
+  → Check API server is running
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎉 THAT'S IT!
+
+ScriptSherpa is your AI guide to test automation.
+
+Install it, test it, love it! 🚀
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+File: /Users/anjana.mohan/QaCoPilot/intellij-plugin/build/distributions/script-sherpa.zip
+Status: READY ✅
+Version: 1.0.0
+Last Updated: June 3, 2026 - 4:10 PM
+
+INSTALL NOW! 🎯

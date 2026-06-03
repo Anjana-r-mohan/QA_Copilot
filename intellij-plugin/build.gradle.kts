@@ -1,10 +1,11 @@
 plugins {
     id("java")
     id("org.jetbrains.intellij") version "1.17.2"
+    id("org.jetbrains.kotlin.jvm") version "1.9.0"
 }
 
 group = "com.bizom"
-version = "1.0.0"
+version = "1.0.0"  // ScriptSherpa version
 
 repositories {
     mavenCentral()
@@ -29,6 +30,6 @@ tasks {
     }
 
     buildPlugin {
-        archiveFileName.set("qa-copilot-intellij.zip")
+        archiveFileName.set("script-sherpa.zip")
     }
 }

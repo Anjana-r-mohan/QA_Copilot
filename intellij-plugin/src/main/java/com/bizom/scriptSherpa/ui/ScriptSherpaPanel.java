@@ -1,4 +1,4 @@
-package com.bizom.qaCopilot.ui;
+package com.bizom.scriptSherpa.ui;
 
 import com.intellij.openapi.diagnostic.Logger;
 import com.intellij.openapi.progress.ProgressIndicator;
@@ -8,7 +8,7 @@ import com.intellij.openapi.project.Project;
 import com.intellij.ui.components.JBPanel;
 import com.intellij.ui.components.JBScrollPane;
 import com.intellij.ui.components.JBTextArea;
-import com.bizom.qaCopilot.backend.BackendConnector;
+import com.bizom.scriptSherpa.backend.BackendConnector;
 import org.jetbrains.annotations.NotNull;
 
 import javax.swing.*;
@@ -16,8 +16,8 @@ import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.*;
 import java.io.File;
 
-public class QACopilotPanel extends JBPanel<QACopilotPanel> {
-    private static final Logger LOG = Logger.getInstance(QACopilotPanel.class);
+public class ScriptSherpaPanel extends JBPanel<ScriptSherpaPanel> {
+    private static final Logger LOG = Logger.getInstance(ScriptSherpaPanel.class);
     
     private final Project project;
     private final JBTextArea chatArea;
@@ -36,7 +36,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
     // Feature flags
     private static final boolean USE_STREAMING = true;  // TRUE = Real-time SSE streaming!
 
-    public QACopilotPanel(Project project) {
+    public ScriptSherpaPanel(Project project) {
         this.project = project;
         this.backendConnector = new BackendConnector();
         setLayout(new BorderLayout());
@@ -66,7 +66,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
         chatArea.setEditable(false);
         chatArea.setLineWrap(true);
         chatArea.setWrapStyleWord(true);
-        chatArea.setText("👋 Welcome to QA Copilot!\n\nClick 📋 or 📄 to select context files, then type your command.\n\n");
+        chatArea.setText("👋 Welcome to ScriptSherpa!\n\nClick 📋 or 📄 to select context files, then type your command.\n\n");
         JBScrollPane chatScroll = new JBScrollPane(chatArea);
         add(chatScroll, BorderLayout.CENTER);
 
@@ -84,7 +84,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
 
         add(bottomPanel, BorderLayout.SOUTH);
 
-        LOG.info("QA Copilot Panel initialized");
+        LOG.info("ScriptSherpa Panel initialized");
     }
 
     private void sendMessage() {
@@ -110,7 +110,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
         chatArea.append("\n📝 You: " + userMessage + "\n");
         
         // Show thinking indicator
-        chatArea.append("🤖 QA Copilot is thinking...\n");
+        chatArea.append("🤖 ScriptSherpa is thinking...\n");
         
         // Clear input
         inputArea.setText("");
@@ -172,7 +172,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
     
     private void processMessageWithModal(String message) {
         // Use IntelliJ's progress modal with background task
-        ProgressManager.getInstance().run(new Task.Backgroundable(project, "QA Copilot Processing...", true) {
+        ProgressManager.getInstance().run(new Task.Backgroundable(project, "ScriptSherpa Processing...", true) {
             private BackendConnector.NavigationResult result;
             private StringBuilder progressLog = new StringBuilder();
             
@@ -225,7 +225,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
                 SwingUtilities.invokeLater(() -> {
                     // Remove thinking indicator
                     String current = chatArea.getText();
-                    String withoutThinking = current.replace("🤖 QA Copilot is thinking...\n", "");
+                    String withoutThinking = current.replace("🤖 ScriptSherpa is thinking...\n", "");
                     chatArea.setText(withoutThinking);
                     
                     // Append all progress
@@ -253,7 +253,7 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
         // Remove "thinking" indicator on first real update
         if ("understanding".equals(type) || "intent".equals(type)) {
             String current = chatArea.getText();
-            String withoutThinking = current.replace("🤖 QA Copilot is thinking...\n", "");
+            String withoutThinking = current.replace("🤖 ScriptSherpa is thinking...\n", "");
             chatArea.setText(withoutThinking);
         }
         
