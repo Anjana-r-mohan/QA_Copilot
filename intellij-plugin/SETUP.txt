@@ -1,0 +1,48 @@
+QA COPILOT INTELLIJ PLUGIN - SETUP GUIDE
+==========================================
+
+PREREQUISITES:
+- IntelliJ IDEA 2023.3 or later
+- JDK 11 or later
+- Gradle 8.0 or later
+
+STEP 1: Build the Plugin
+------------------------
+cd /Users/anjana.mohan/QaCoPilot/intellij-plugin
+./gradlew build
+
+STEP 2: Start Python Backend
+----------------------------
+# In a separate terminal
+cd /Users/anjana.mohan/QaCoPilot
+python lsp_server.py
+
+# OR use the API server instead:
+python api_server.py
+
+STEP 3: Open in IntelliJ
+------------------------
+1. Open IntelliJ IDEA
+2. File → Open → Select /Users/anjana.mohan/QaCoPilot/intellij-plugin
+3. Click "Trust Project" if prompted
+4. Wait for Gradle to sync
+
+STEP 4: Run the Plugin
+----------------------
+1. In IntelliJ, go to Run → Edit Configurations
+2. Click "+" and select "Gradle"
+3. Name it "Run Plugin"
+4. Set Tasks to: runIde
+5. Click Run
+
+STEP 5: Test the Plugin
+-----------------------
+1. A new IntelliJ window will open with the plugin running
+2. Look for "QA Copilot" in the right sidebar (Tool Windows)
+3. Type a command like: "Navigate to PJP screen and start call"
+4. Click Send
+
+TROUBLESHOOTING:
+- If Gradle fails, run: ./gradlew --refresh-dependencies
+- If plugin doesn't appear, restart IntelliJ
+- Check logs in: /tmp/qa_copilot_lsp.log

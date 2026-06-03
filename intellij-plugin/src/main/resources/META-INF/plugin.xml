@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<idea-plugin>
+    <id>com.bizom.qa-copilot</id>
+    <name>QA Copilot</name>
+    <vendor email="support@bizom.com" url="https://www.bizom.com">Bizom</vendor>
+    <idea-version since-build="223" until-build="999.*"/>
+    
+    <description><![CDATA[
+        AI-powered QA automation for mobile apps.
+        Use natural language to navigate app UI, collect locators, and generate tests.
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>com.intellij.modules.java</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow factoryClass="com.bizom.qaCopilot.ui.QACopilotToolWindowFactory" 
+                   id="QA Copilot" 
+                   anchor="right" 
+                   secondary="false"/>
+        <notificationGroup id="QA Copilot" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <action id="QACopilot.NavigateUI" 
+               class="com.bizom.qaCopilot.actions.NavigateUIAction"
+               text="Navigate UI"
+               description="Navigate through app UI based on natural language">
+            <keyboard-shortcut keymap="$default" first-keystroke="cmd alt n"/>
+        </action>
+
+        <action id="QACopilot.ExploreApp"
+               class="com.bizom.qaCopilot.actions.ExploreAppAction"
+               text="Explore App"
+               description="Explore app screens and collect locators">
+            <keyboard-shortcut keymap="$default" first-keystroke="cmd alt e"/>
+        </action>
+
+        <group id="QACopilot.Menu" text="QA Copilot" description="QA Copilot Actions">
+            <action id="QACopilot.ShowChat" class="com.bizom.qaCopilot.actions.ShowChatAction"/>
+            <separator/>
+            <reference id="QACopilot.NavigateUI"/>
+            <reference id="QACopilot.ExploreApp"/>
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+        </group>
+    </actions>
+</idea-plugin>
