@@ -9,7 +9,7 @@ import sqlite3
 from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 import os
 
 
@@ -17,8 +17,30 @@ class PreconditionSetupManager:
     def __init__(self):
         load_dotenv(override=False)
 
-    def _env_first(self, keys: List[str]) -> str:
+    def _load_env_context(self, workspace_path: Optional[str]) -> Dict[str, str]:
+        context: Dict[str, str] = {}
+        if workspace_path:
+            env_path = os.path.join(workspace_path, ".env")
+            if os.path.isfile(env_path):
+                try:
+                    loaded = dotenv_values(env_path)
+                    for key, value in loaded.items():
+                        if key is None:
+                            continue
+                        normalized_key = str(key).strip()
+                        normalized_value = str(value).strip() if value is not None else ""
+                        if normalized_value:
+                            context[normalized_key] = normalized_value
+                except Exception:
+                    pass
+        return context
+
+    def _env_first(self, keys: List[str], env_context: Optional[Dict[str, str]] = None) -> str:
+        env_context = env_context or {}
         for key in keys:
+            value = str(env_context.get(key, "")).strip()
+            if value:
+                return value
             value = os.getenv(key, "").strip()
             if value:
                 return value
@@ -32,12 +54,13 @@ class PreconditionSetupManager:
         normalized = normalized.strip(" :")
         return normalized
 
-    def get_profile_summary(self) -> Dict:
+    def get_profile_summary(self, workspace_path: Optional[str] = None) -> Dict:
         load_dotenv(override=False)
-        company_url = self._env_first(["COMPANY_URL", "COMPANY_BASE_URL", "APP_COMPANY_URL"])
-        admin_user = self._env_first(["ADMIN_USERNAME", "ADMIN_USER", "ADMIN_EMAIL"])
-        db_url = self._env_first(["DATABASE_URL", "DB_URL"])
-        api_url = self._env_first(["PRECONDITION_API_URL", "PRECONDITION_ENDPOINT"])
+        env_context = self._load_env_context(workspace_path)
+        company_url = self._env_first(["COMPANY_URL", "COMPANY_BASE_URL", "APP_COMPANY_URL"], env_context)
+        admin_user = self._env_first(["ADMIN_USERNAME", "ADMIN_USER", "ADMIN_EMAIL"], env_context)
+        db_url = self._resolve_db_url(env_context)
+        api_url = self._env_first(["PRECONDITION_API_URL", "PRECONDITION_ENDPOINT"], env_context)
 
         return {
             "company_url": company_url,
@@ -45,6 +68,23 @@ class PreconditionSetupManager:
             "db_configured": bool(db_url),
             "api_configured": bool(api_url),
         }
+
+    def _resolve_db_url(self, env_context: Optional[Dict[str, str]] = None) -> str:
+        env_context = env_context or {}
+        direct_url = self._env_first(["DATABASE_URL", "DB_URL"], env_context)
+        if direct_url:
+            return direct_url
+
+        host = self._env_first(["DB_SERVER", "DB_HOST"], env_context)
+        port = self._env_first(["DB_PORT"], env_context) or "5432"
+        db_name = self._env_first(["DB_NAME", "GNEXT_DB_NAME", "DATABASE_NAME"], env_context)
+        username = self._env_first(["DB_USERNAME", "DB_USER", "USER_NAME", "USERNAME"], env_context)
+        password = self._env_first(["DB_PASSWORD", "PASSWORD", "PASS"], env_context)
+
+        if host and db_name and username and password:
+            return f"postgresql://{username}:{password}@{host}:{port}/{db_name}"
+
+        return ""
 
     def extract_preconditions(self, context_text: str) -> List[str]:
         if not context_text:
@@ -82,12 +122,18 @@ class PreconditionSetupManager:
 
         return preconditions[:40]
 
-    def apply_preconditions(self, preconditions: List[str], send_progress: Optional[Callable] = None) -> Dict:
+    def apply_preconditions(
+        self,
+        preconditions: List[str],
+        send_progress: Optional[Callable] = None,
+        workspace_path: Optional[str] = None,
+    ) -> Dict:
         def emit(msg_type: str, message: str):
             if send_progress:
                 send_progress(msg_type, message)
 
-        profile = self.get_profile_summary()
+        env_context = self._load_env_context(workspace_path)
+        profile = self.get_profile_summary(workspace_path=workspace_path)
         emit(
             "progress",
             (
@@ -100,8 +146,18 @@ class PreconditionSetupManager:
         )
 
         applied = 0
+        actionable_count = 0
         skipped = []
         errors = []
+        warnings = []
+
+        missing_fields = []
+        if not profile.get("company_url"):
+            missing_fields.append("COMPANY_URL")
+        if not profile.get("admin_configured"):
+            missing_fields.extend(["ADMIN_USERNAME", "ADMIN_PASSWORD"])
+        if not (profile.get("db_configured") or profile.get("api_configured")):
+            missing_fields.append("PRECONDITION_API_URL or DATABASE_URL")
 
         for item in preconditions:
             parsed = self._parse_toggle_precondition(item)
@@ -109,8 +165,9 @@ class PreconditionSetupManager:
                 skipped.append(item)
                 continue
 
+            actionable_count += 1
             setting_key, enabled = parsed
-            result = self._apply_setting(setting_key, enabled)
+            result = self._apply_setting(setting_key, enabled, env_context)
             if result.get("success"):
                 applied += 1
                 emit("success", f"✅ Precondition applied: {setting_key}={'enabled' if enabled else 'disabled'}")
@@ -118,12 +175,30 @@ class PreconditionSetupManager:
                 errors.append(f"{item}: {result.get('error', 'unknown error')}")
                 emit("warning", f"⚠️ Precondition failed: {item}")
 
-        success = len(errors) == 0
+        if actionable_count == 0 and preconditions:
+            warnings.append(
+                "Preconditions found, but none are machine-actionable toggle rules. "
+                "Rewrite preconditions with explicit enable/disable statements or provide setup input."
+            )
+
+        if actionable_count > 0 and applied == 0 and not errors:
+            errors.append(
+                "No actionable precondition could be applied. Check .env setup and backend connectivity."
+            )
+
+        if missing_fields and actionable_count > 0:
+            errors.append(
+                "Missing setup fields: " + ", ".join(dict.fromkeys(missing_fields))
+            )
+
+        success = len(errors) == 0 and (applied > 0 or actionable_count == 0)
         return {
             "success": success,
             "applied": applied,
+            "actionable": actionable_count,
             "skipped": skipped,
             "errors": errors,
+            "warnings": warnings,
             "profile": profile,
         }
 
@@ -148,19 +223,18 @@ class PreconditionSetupManager:
 
         return None
 
-    def _apply_setting(self, setting_key: str, enabled: bool) -> Dict:
-        api_url = self._env_first(["PRECONDITION_API_URL", "PRECONDITION_ENDPOINT"])
+    def _apply_setting(self, setting_key: str, enabled: bool, env_context: Optional[Dict[str, str]] = None) -> Dict:
+        env_context = env_context or {}
+        api_url = self._env_first(["PRECONDITION_API_URL", "PRECONDITION_ENDPOINT"], env_context)
         if api_url:
-            api_result = self._apply_via_api(api_url, setting_key, enabled)
+            api_result = self._apply_via_api(api_url, setting_key, enabled, env_context)
             if api_result.get("success"):
                 return api_result
 
-        db_url = self._env_first(["DATABASE_URL", "DB_URL"])
+        db_url = self._resolve_db_url(env_context)
         if db_url:
-            sql_template = os.getenv(
-                "PRECONDITION_SQL_ENABLE_TEMPLATE" if enabled else "PRECONDITION_SQL_DISABLE_TEMPLATE",
-                "",
-            ).strip()
+            template_key = "PRECONDITION_SQL_ENABLE_TEMPLATE" if enabled else "PRECONDITION_SQL_DISABLE_TEMPLATE"
+            sql_template = str(env_context.get(template_key, "")).strip() or os.getenv(template_key, "").strip()
             if not sql_template:
                 return {
                     "success": False,
@@ -170,8 +244,8 @@ class PreconditionSetupManager:
             sql = sql_template.format(
                 setting=setting_key,
                 enabled=1 if enabled else 0,
-                company_url=self._env_first(["COMPANY_URL", "COMPANY_BASE_URL", "APP_COMPANY_URL"]),
-                admin_username=self._env_first(["ADMIN_USERNAME", "ADMIN_USER", "ADMIN_EMAIL"]),
+                company_url=self._env_first(["COMPANY_URL", "COMPANY_BASE_URL", "APP_COMPANY_URL"], env_context),
+                admin_username=self._env_first(["ADMIN_USERNAME", "ADMIN_USER", "ADMIN_EMAIL"], env_context),
             )
             return self._execute_sql(db_url, sql)
 
@@ -180,14 +254,15 @@ class PreconditionSetupManager:
             "error": "No precondition backend configured. Set PRECONDITION_API_URL or DATABASE_URL in .env",
         }
 
-    def _apply_via_api(self, api_url: str, setting_key: str, enabled: bool) -> Dict:
+    def _apply_via_api(self, api_url: str, setting_key: str, enabled: bool, env_context: Optional[Dict[str, str]] = None) -> Dict:
+        env_context = env_context or {}
         try:
             payload = {
-                "company_url": self._env_first(["COMPANY_URL", "COMPANY_BASE_URL", "APP_COMPANY_URL"]),
-                "admin_username": self._env_first(["ADMIN_USERNAME", "ADMIN_USER", "ADMIN_EMAIL"]),
-                "admin_password": self._env_first(["ADMIN_PASSWORD", "ADMIN_PASS"]),
-                "test_user_username": self._env_first(["TEST_USER_USERNAME", "TEST_USERNAME", "QA_USER_USERNAME"]),
-                "test_user_password": self._env_first(["TEST_USER_PASSWORD", "TEST_PASSWORD", "QA_USER_PASSWORD"]),
+                "company_url": self._env_first(["COMPANY_URL", "COMPANY_BASE_URL", "APP_COMPANY_URL"], env_context),
+                "admin_username": self._env_first(["ADMIN_USERNAME", "ADMIN_USER", "ADMIN_EMAIL"], env_context),
+                "admin_password": self._env_first(["ADMIN_PASSWORD", "ADMIN_PASS"], env_context),
+                "test_user_username": self._env_first(["TEST_USER_USERNAME", "TEST_USERNAME", "QA_USER_USERNAME"], env_context),
+                "test_user_password": self._env_first(["TEST_USER_PASSWORD", "TEST_PASSWORD", "QA_USER_PASSWORD"], env_context),
                 "setting": setting_key,
                 "enabled": enabled,
             }

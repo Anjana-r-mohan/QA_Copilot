@@ -569,7 +569,7 @@ public class MobileTest {
                     if cleaned and self._is_actionable_step(cleaned):
                         section_steps.append(cleaned)
             if section_steps:
-                return section_steps[:40]
+                return self._dedupe_steps(section_steps)[:40]
 
         if any(token in text for token in ["package ", "import ", "public class", "private ", "caps.setCapability("]):
             text = "\n".join(
@@ -590,10 +590,22 @@ public class MobileTest {
                 if cleaned and self._is_actionable_step(cleaned):
                     steps.append(cleaned)
         if steps:
-            return steps
+            return self._dedupe_steps(steps)
 
         sentence_parts = re.split(r'\bthen\b|,', text, flags=re.IGNORECASE)
-        return [self._normalize_step_text(part.strip()) for part in sentence_parts if len(part.strip()) > 8 and self._is_actionable_step(part.strip())][:8]
+        fallback_steps = [self._normalize_step_text(part.strip()) for part in sentence_parts if len(part.strip()) > 8 and self._is_actionable_step(part.strip())]
+        return self._dedupe_steps(fallback_steps)[:8]
+
+    def _dedupe_steps(self, steps: List[str]) -> List[str]:
+        deduped = []
+        seen = set()
+        for step in steps:
+            normalized = re.sub(r'\s+', ' ', step.strip().lower())
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(step)
+        return deduped
 
     def _normalize_step_text(self, step: str) -> str:
         normalized = re.sub(r'(?i)(enabled|disabled)(click|tap|open|select|enter)', r'\1 \2', step)
@@ -809,20 +821,36 @@ public class BaseMobileTest {
         """
         
         saved_files = []
-        
-        # Create generated_tests directory
+
+        # Reuse a stable project folder so code is incrementally updated.
         output_dir = os.path.join(workspace_path, "generated_tests")
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        project_dir = os.path.join(output_dir, f"{analysis['framework']}_{timestamp}")
+        os.makedirs(output_dir, exist_ok=True)
+        project_dir = os.path.join(output_dir, f"{analysis['framework']}_current")
         os.makedirs(project_dir, exist_ok=True)
+
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Save each file
         for file_info in generated_code.get('files', []):
             file_path = os.path.join(project_dir, file_info['path'])
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            
+
+            content_to_write = file_info['content']
+            file_name = os.path.basename(file_path)
+
+            # Preserve existing scaffolding once created.
+            if os.path.exists(file_path) and file_name in {"BaseMobileTest.java", "pom.xml"}:
+                print(f"ℹ️ Reusing existing: {file_path}")
+                saved_files.append(file_path)
+                continue
+
+            if os.path.exists(file_path) and file_name == "GeneratedMobileFlowTest.java":
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    existing = f.read()
+                content_to_write = self._merge_generated_test(existing, file_info['content'], run_id)
+
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(file_info['content'])
+                f.write(content_to_write)
             
             saved_files.append(file_path)
             print(f"✅ Saved: {file_path}")
@@ -862,6 +890,28 @@ public class BaseMobileTest {
         print(f"✅ Saved: {readme_path}")
         
         return saved_files
+
+    def _merge_generated_test(self, existing_content: str, new_content: str, run_id: str) -> str:
+        method_match = re.search(
+            r"@Test\s+public void executeGeneratedFlow\(\) \{([\s\S]*?)\n\s*\}\n\s*\}",
+            new_content,
+        )
+        if not method_match:
+            return existing_content
+
+        method_body = method_match.group(1).rstrip()
+        method_name = f"executeGeneratedFlow_{run_id}"
+        new_method = (
+            "\n    @Test\n"
+            f"    public void {method_name}() {{\n"
+            f"{method_body}\n"
+            "    }\n"
+        )
+
+        insert_at = existing_content.rfind("}")
+        if insert_at == -1:
+            return existing_content
+        return existing_content[:insert_at] + new_method + "\n" + existing_content[insert_at:]
 
 
 def demo():

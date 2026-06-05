@@ -1,0 +1,93 @@
+{
+  "name": "qa-agent",
+  "displayName": "QA Agent - Mobile Test Automation",
+  "description": "AI-powered mobile QA automation agent with Appium MCP + QaCoPilot backend. Standalone sidebar chat for device interaction, test generation, and codebase analysis.",
+  "version": "2.0.0",
+  "publisher": "qa-team",
+  "engines": { "vscode": "^1.93.0" },
+  "categories": ["Testing", "Other"],
+  "keywords": ["appium", "mobile", "testing", "automation", "mcp", "qa", "android"],
+  "main": "./src/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "qaAgent",
+          "title": "QA Agent",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "qaAgent": [
+        {
+          "type": "webview",
+          "id": "qaAgent.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      { "command": "qaAgent.focus", "title": "QA Agent: Open Chat" },
+      { "command": "qaAgent.clearChat", "title": "QA Agent: Clear Chat" },
+      { "command": "qaAgent.startBackend", "title": "QA Agent: Start QaCoPilot Backend" }
+    ],
+    "configuration": {
+      "title": "QA Agent",
+      "properties": {
+        "qaAgent.geminiApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Google Gemini API key for AI features"
+        },
+        "qaAgent.geminiModel": {
+          "type": "string",
+          "default": "gemini-2.0-flash",
+          "enum": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+          "description": "Gemini model to use"
+        },
+        "qaAgent.javaPath": {
+          "type": "string",
+          "default": "java",
+          "description": "Path to Java executable"
+        },
+        "qaAgent.serverJar": {
+          "type": "string",
+          "default": "",
+          "description": "Path to appium-mcp-server JAR. Auto-detected if empty."
+        },
+        "qaAgent.appiumUrl": {
+          "type": "string",
+          "default": "http://127.0.0.1:4723",
+          "description": "Appium server URL"
+        },
+        "qaAgent.deviceName": {
+          "type": "string",
+          "default": "",
+          "description": "Android device name (e.g., 127.0.0.1:6555 or emulator-5554)"
+        },
+        "qaAgent.appPackage": {
+          "type": "string",
+          "default": "",
+          "description": "Android app package (e.g., com.example.app)"
+        },
+        "qaAgent.appActivity": {
+          "type": "string",
+          "default": "",
+          "description": "Android app activity (e.g., .MainActivity)"
+        },
+        "qaAgent.backendUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "QaCoPilot Python backend URL (for test plans, code analysis)"
+        },
+        "qaAgent.backendPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to QaCoPilot directory (for Start Backend command)"
+        }
+      }
+    }
+  }
+}

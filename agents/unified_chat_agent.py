@@ -28,7 +28,10 @@ class UnifiedChatAgent:
 
         self.gemini_api_key = ""
         self.has_gemini = False
+        self.anthropic_api_key = ""
+        self.has_anthropic = False
         self._refresh_gemini_key()
+        self._refresh_anthropic_key()
         self.precondition_setup = PreconditionSetupManager()
 
         self._init_ollama()
@@ -42,6 +45,14 @@ class UnifiedChatAgent:
             or os.getenv("GOOGLE_GENAI_API_KEY", "").strip()
         )
         self.has_gemini = bool(self.gemini_api_key)
+
+    def _refresh_anthropic_key(self):
+        load_dotenv(override=False)
+        self.anthropic_api_key = (
+            os.getenv("ANTHROPIC_API_KEY", "").strip()
+            or os.getenv("CLAUDE_API_KEY", "").strip()
+        )
+        self.has_anthropic = bool(self.anthropic_api_key)
 
     def _init_ollama(self):
         try:
@@ -94,6 +105,7 @@ class UnifiedChatAgent:
         )
 
         self._refresh_gemini_key()
+        self._refresh_anthropic_key()
         if self._is_gemini_model(selected_model):
             if self.has_gemini:
                 send_progress("progress", f"🧠 Gemini active: {selected_model}")
@@ -101,6 +113,14 @@ class UnifiedChatAgent:
                 send_progress(
                     "warning",
                     "⚠️ Gemini selected but no API key found. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in .env and restart server; falling back",
+                )
+        elif self._is_claude_model(selected_model):
+            if self.has_anthropic:
+                send_progress("progress", f"🧠 Claude active: {selected_model}")
+            else:
+                send_progress(
+                    "warning",
+                    "⚠️ Claude selected but no API key found. Set ANTHROPIC_API_KEY in .env and restart server; falling back",
                 )
 
         session["history"].append(
@@ -180,36 +200,54 @@ class UnifiedChatAgent:
             plan_preconditions = self.precondition_setup.extract_preconditions(attachment_context)
             if plan_preconditions:
                 send_progress("progress", f"🛠️ Applying {len(plan_preconditions)} precondition(s) from plan")
-                setup_result = self.precondition_setup.apply_preconditions(plan_preconditions, send_progress)
+                setup_result = self.precondition_setup.apply_preconditions(
+                    plan_preconditions,
+                    send_progress,
+                    workspace_path=workspace_path,
+                )
                 if not setup_result.get("success"):
+                    guidance = (
+                        "I could not apply preconditions, so I am stopping before unreliable execution.\n"
+                        f"Missing/failed setup: {'; '.join(setup_result.get('errors', []))}.\n"
+                        "Next: either (1) add .env setup keys and backend config, or (2) rewrite preconditions in explicit toggle format like 'insights should be enabled'.\n"
+                        "Then send: retry with preconditions."
+                    )
+                    send_progress("chat_response", guidance)
                     return {
                         "success": False,
                         "type": intent["type"],
                         "error": "Precondition setup failed",
                         "details": "; ".join(setup_result.get("errors", [])) or "Unable to apply required preconditions",
+                        "message": guidance,
                         "session_id": sid,
                         "state": self._session_state(session),
                     }
 
-                send_progress("progress", "🔄 Relaunching app to sync precondition changes")
-                relaunch = self.mcp_server.call_tool(
-                    "perform_action",
-                    {
-                        "action": "relaunch_app",
-                        "app_package": app_package,
-                        "app_activity": app_activity,
-                    },
-                )
-                if not relaunch.get("success"):
-                    return {
-                        "success": False,
-                        "type": intent["type"],
-                        "error": "App relaunch failed after preconditions",
-                        "details": relaunch.get("error", "Relaunch action failed"),
-                        "session_id": sid,
-                        "state": self._session_state(session),
-                    }
-                send_progress("success", "✅ Preconditions applied and app relaunched")
+                for warn in setup_result.get("warnings", []):
+                    send_progress("warning", f"⚠️ {warn}")
+
+                if int(setup_result.get("applied", 0)) > 0:
+                    send_progress("progress", "🔄 Relaunching app to sync precondition changes")
+                    relaunch = self.mcp_server.call_tool(
+                        "perform_action",
+                        {
+                            "action": "relaunch_app",
+                            "app_package": app_package,
+                            "app_activity": app_activity,
+                        },
+                    )
+                    if not relaunch.get("success"):
+                        return {
+                            "success": False,
+                            "type": intent["type"],
+                            "error": "App relaunch failed after preconditions",
+                            "details": relaunch.get("error", "Relaunch action failed"),
+                            "session_id": sid,
+                            "state": self._session_state(session),
+                        }
+                    send_progress("success", "✅ Preconditions applied and app relaunched")
+                else:
+                    send_progress("progress", "ℹ️ No machine-applied precondition change detected; continuing without relaunch")
 
             exploration = self._run_agent_loop(
                 session=session,
@@ -221,6 +259,61 @@ class UnifiedChatAgent:
             )
 
             if not exploration.get("success"):
+                if self._is_recoverable_navigation_error(exploration):
+                    healed = self._attempt_autonomous_recovery(
+                        session=session,
+                        send_progress=send_progress,
+                        app_package=app_package,
+                        app_activity=app_activity,
+                        attachment_context=attachment_context,
+                    )
+                    if healed:
+                        send_progress("progress", "🔁 Retrying navigation after auto-heal")
+                        exploration = self._run_agent_loop(
+                            session=session,
+                            user_message=user_message,
+                            workspace_path=workspace_path,
+                            send_progress=send_progress,
+                            max_steps=intent.get("max_steps", self._steps_for_agent_type(session.get("agent_type", "balanced"))),
+                            attachment_context=attachment_context,
+                        )
+
+                if exploration.get("success"):
+                    session["autonomous_retry_count"] = 0
+                else:
+                    session["autonomous_retry_count"] = 0
+
+            if not exploration.get("success"):
+                if exploration.get("error") == "Expected result not observed":
+                    profile = self.precondition_setup.get_profile_summary(workspace_path=workspace_path)
+                    missing = []
+                    if not profile.get("company_url"):
+                        missing.append("COMPANY_URL")
+                    if not profile.get("admin_configured"):
+                        missing.extend(["ADMIN_USERNAME", "ADMIN_PASSWORD"])
+                    if not (profile.get("db_configured") or profile.get("api_configured")):
+                        missing.append("PRECONDITION_API_URL or DATABASE_URL")
+
+                    if missing:
+                        guidance = (
+                            "Expected result was not observed. This usually means precondition config/state is incomplete.\n"
+                            f"Missing setup in .env: {', '.join(dict.fromkeys(missing))}.\n"
+                            "Next: fill these values and send: retry with preconditions."
+                        )
+                    else:
+                        guidance = (
+                            "Expected result was not observed after executing steps.\n"
+                            "Likely cause: data/state mismatch for this testcase (not parser/generation issue).\n"
+                            "Next: confirm scenario data, then send: continue from current step."
+                        )
+
+                    send_progress("chat_response", guidance)
+                    return {
+                        **exploration,
+                        "message": guidance,
+                        "session_id": sid,
+                        "state": self._session_state(session),
+                    }
                 return {**exploration, "session_id": sid, "state": self._session_state(session)}
 
             completion_response = self._post_navigation_response(session, user_message, exploration)
@@ -311,6 +404,7 @@ class UnifiedChatAgent:
                 "recent_actions": [],
                 "consecutive_failures": 0,
                 "expected_outcomes": [],
+                "autonomous_retry_count": 0,
             }
         return self.sessions[session_id]
 
@@ -341,6 +435,7 @@ class UnifiedChatAgent:
             for keyword in [
                 "navigate",
                 "explore",
+                "xplore",
                 "tap",
                 "click",
                 "scroll",
@@ -372,6 +467,8 @@ class UnifiedChatAgent:
                 "typescript",
                 "python",
                 "java",
+                "rest case",
+                "tset",
             ]
         )
 
@@ -410,6 +507,63 @@ class UnifiedChatAgent:
             }
 
         return {"type": "general_chat", "description": "General conversation"}
+
+    def _is_recoverable_navigation_error(self, exploration: Dict) -> bool:
+        error = str(exploration.get("error", "")).lower()
+        return any(
+            token in error
+            for token in [
+                "expected result not observed",
+                "action execution failed",
+                "no plan step executed",
+                "no actionable ui elements found",
+            ]
+        )
+
+    def _attempt_autonomous_recovery(
+        self,
+        session: Dict,
+        send_progress: Callable,
+        app_package: str,
+        app_activity: str,
+        attachment_context: str,
+    ) -> bool:
+        retry_count = int(session.get("autonomous_retry_count", 0))
+        if retry_count >= 2:
+            return False
+
+        session["autonomous_retry_count"] = retry_count + 1
+        send_progress("progress", f"🩹 Auto-heal attempt {session['autonomous_retry_count']}/2")
+
+        current_step = self._current_plan_step_text(session)
+        if current_step:
+            screen_data = self.mcp_server.call_tool("explore_screen", {})
+            if screen_data.get("success"):
+                elements = screen_data.get("elements", [])
+                candidate = self._match_element_to_objective(current_step + " " + attachment_context, elements, session)
+                if candidate and candidate.get("xpath"):
+                    click_result = self.mcp_server.call_tool(
+                        "perform_action",
+                        {"action": "click", "xpath": candidate.get("xpath"), "reason": "auto-heal rematch"},
+                    )
+                    if click_result.get("success"):
+                        send_progress("success", "✅ Auto-heal matched and clicked fallback target")
+                        return True
+
+        relaunch = self.mcp_server.call_tool(
+            "perform_action",
+            {
+                "action": "relaunch_app",
+                "app_package": app_package,
+                "app_activity": app_activity,
+            },
+        )
+        if relaunch.get("success"):
+            send_progress("success", "✅ Auto-heal relaunched app and will retry steps")
+            return True
+
+        send_progress("warning", f"⚠️ Auto-heal failed: {relaunch.get('error', 'unknown relaunch error')}")
+        return False
 
     def _steps_for_agent_type(self, agent_type: str) -> int:
         if agent_type == "planner":
@@ -1150,7 +1304,7 @@ class UnifiedChatAgent:
             return "Gradle"
         if "page object" in msg:
             return "Page Object Model"
-        return "Standard"
+        return "Maven POM"
 
     def _help_text(self) -> str:
         return (
@@ -1235,8 +1389,13 @@ class UnifiedChatAgent:
             if response:
                 return response
 
+        if self._is_claude_model(model):
+            response = self._run_claude_prompt(prompt, model, max_tokens=max_tokens)
+            if response:
+                return response
+
         if self.use_ollama:
-            selected_model = model if model and not self._is_gemini_model(model) else self.default_ollama_model
+            selected_model = model if model and not self._is_gemini_model(model) and not self._is_claude_model(model) else self.default_ollama_model
             response = self._run_ollama_prompt(prompt, selected_model, max_tokens=max_tokens)
             if response:
                 return response
@@ -1304,8 +1463,48 @@ class UnifiedChatAgent:
 
         return None
 
+    def _run_claude_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300) -> Optional[str]:
+        if not self.has_anthropic:
+            return None
+
+        selected_model = model or "claude-3-5-sonnet-latest"
+        aliases = {
+            "claude-sonnet": "claude-3-5-sonnet-latest",
+            "claude-haiku": "claude-3-5-haiku-latest",
+        }
+        selected_model = aliases.get(selected_model, selected_model)
+
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": selected_model,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=45,
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                parts = payload.get("content", [])
+                text = "\n".join(part.get("text", "") for part in parts if isinstance(part, dict) and part.get("type") == "text")
+                return text.strip() if text else None
+        except Exception:
+            return None
+
+        return None
+
     def _is_gemini_model(self, model: Optional[str]) -> bool:
         return bool(model and model.lower().startswith("gemini"))
+
+    def _is_claude_model(self, model: Optional[str]) -> bool:
+        return bool(model and model.lower().startswith("claude"))
 
     def _extract_json_object(self, text: str) -> Optional[Dict]:
         try:
