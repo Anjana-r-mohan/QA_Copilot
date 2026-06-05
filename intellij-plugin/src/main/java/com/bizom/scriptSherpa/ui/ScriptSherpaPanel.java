@@ -26,6 +26,7 @@ public class ScriptSherpaPanel extends JBPanel<ScriptSherpaPanel> {
     private final JLabel selectedContextLabel;
     private String selectedTestPlanPath = "";
     private String selectedCsvPath = "";
+    private String lastLocatorsFile = "";  // Track last generated locators file
     
     // Hidden configuration (hardcoded defaults)
     private static final String DEVICE_NAME = "127.0.0.1:6555";
@@ -41,7 +42,7 @@ public class ScriptSherpaPanel extends JBPanel<ScriptSherpaPanel> {
         this.backendConnector = new BackendConnector();
         setLayout(new BorderLayout());
 
-        // Top: File Selection Only (Clean, Simple UI)
+        // Top: File Selection + Generate Tests Button
         JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 5));
         
         JButton pickTestPlanBtn = new JButton("📋 Test Plan");
@@ -53,6 +54,16 @@ public class ScriptSherpaPanel extends JBPanel<ScriptSherpaPanel> {
         pickCsvBtn.setPreferredSize(new Dimension(100, 30));
         pickCsvBtn.addActionListener(e -> selectCSV());
         topPanel.add(pickCsvBtn);
+        
+        // Add separator
+        topPanel.add(new JLabel("  |  "));
+        
+        // Add Generate Tests button
+        JButton generateTestsBtn = new JButton("✨ Generate Tests");
+        generateTestsBtn.setPreferredSize(new Dimension(150, 30));
+        generateTestsBtn.setToolTipText("Generate test code using AI");
+        generateTestsBtn.addActionListener(e -> showGenerateTestsDialog());
+        topPanel.add(generateTestsBtn);
         
         selectedContextLabel = new JLabel("📌 No files selected");
         selectedContextLabel.setFont(selectedContextLabel.getFont().deriveFont(Font.ITALIC, 11));
@@ -304,6 +315,11 @@ public class ScriptSherpaPanel extends JBPanel<ScriptSherpaPanel> {
                     int locators = result.has("locators_collected") ? result.get("locators_collected").getAsInt() : 0;
                     String file = result.has("locators_file") ? result.get("locators_file").getAsString() : "";
                     
+                    // Save locators file path for code generation
+                    if (!file.isEmpty()) {
+                        lastLocatorsFile = file;
+                    }
+                    
                     chatArea.append("\n" + "═".repeat(50) + "\n");
                     chatArea.append("✅ Navigation Complete!\n");
                     chatArea.append(String.format("   Test Cases Executed: %d\n", steps));
@@ -362,6 +378,149 @@ public class ScriptSherpaPanel extends JBPanel<ScriptSherpaPanel> {
             updateContextLabel();
             LOG.info("Selected CSV: " + selectedCsvPath);
         }
+    }
+
+    
+    private void showGenerateTestsDialog() {
+        // Create dialog for test generation
+        JDialog dialog = new JDialog((Frame) SwingUtilities.getWindowAncestor(this), "Generate Test Code", true);
+        dialog.setLayout(new BorderLayout(10, 10));
+        dialog.setSize(500, 300);
+        dialog.setLocationRelativeTo(this);
+        
+        // Main panel
+        JPanel mainPanel = new JPanel(new BorderLayout(10, 10));
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(15, 15, 15, 15));
+        
+        // Instruction panel
+        JPanel instructionPanel = new JPanel(new BorderLayout(5, 5));
+        instructionPanel.add(new JLabel("Tell me what kind of tests to generate:"), BorderLayout.NORTH);
+        
+        JBTextArea instructionArea = new JBTextArea();
+        instructionArea.setRows(5);
+        instructionArea.setLineWrap(true);
+        instructionArea.setWrapStyleWord(true);
+        instructionArea.setText("Generate Playwright tests in TypeScript with proper project structure");
+        instructionPanel.add(new JBScrollPane(instructionArea), BorderLayout.CENTER);
+        
+        mainPanel.add(instructionPanel, BorderLayout.CENTER);
+        
+        // Info panel
+        JPanel infoPanel = new JPanel(new GridLayout(3, 1, 5, 5));
+        infoPanel.setBorder(BorderFactory.createTitledBorder("Context"));
+        
+        String testPlanInfo = selectedTestPlanPath.isEmpty() ? "None selected" : new File(selectedTestPlanPath).getName();
+        String locatorsInfo = lastLocatorsFile.isEmpty() ? "None available" : new File(lastLocatorsFile).getName();
+        
+        infoPanel.add(new JLabel("📋 Test Plan: " + testPlanInfo));
+        infoPanel.add(new JLabel("🔍 Locators: " + locatorsInfo));
+        infoPanel.add(new JLabel("📁 Workspace: " + WORKSPACE_PATH));
+        
+        mainPanel.add(infoPanel, BorderLayout.NORTH);
+        
+        // Button panel
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton generateBtn = new JButton("✨ Generate");
+        JButton cancelBtn = new JButton("Cancel");
+        
+        generateBtn.addActionListener(e -> {
+            String instruction = instructionArea.getText().trim();
+            if (!instruction.isEmpty()) {
+                dialog.dispose();
+                generateTestCode(instruction);
+            }
+        });
+        
+        cancelBtn.addActionListener(e -> dialog.dispose());
+        
+        buttonPanel.add(cancelBtn);
+        buttonPanel.add(generateBtn);
+        
+        mainPanel.add(buttonPanel, BorderLayout.SOUTH);
+        
+        dialog.add(mainPanel);
+        dialog.setVisible(true);
+    }
+    
+    private void generateTestCode(String instruction) {
+        // Display user instruction in chat
+        chatArea.append("\n✨ Generating Tests\n");
+        chatArea.append("📝 Instruction: " + instruction + "\n");
+        chatArea.append("🤖 ScriptSherpa is working...\n");
+        
+        // Generate in background
+        new Thread(() -> {
+            try {
+                backendConnector.generateTestCode(
+                    instruction,
+                    selectedTestPlanPath.isEmpty() ? null : selectedTestPlanPath,
+                    lastLocatorsFile.isEmpty() ? null : lastLocatorsFile,
+                    WORKSPACE_PATH,
+                    progressUpdate -> {
+                        SwingUtilities.invokeLater(() -> {
+                            handleCodeGenerationProgress(progressUpdate);
+                        });
+                    }
+                );
+            } catch (Exception e) {
+                LOG.error("Code generation failed", e);
+                SwingUtilities.invokeLater(() -> {
+                    chatArea.append("❌ Error: " + e.getMessage() + "\n\n");
+                });
+            }
+        }).start();
+    }
+    
+    private void handleCodeGenerationProgress(BackendConnector.ProgressUpdate update) {
+        String type = update.type;
+        String message = update.message;
+        
+        // Remove "working" indicator on first update
+        if ("understanding".equals(type)) {
+            String current = chatArea.getText();
+            String withoutWorking = current.replace("🤖 ScriptSherpa is working...\n", "");
+            chatArea.setText(withoutWorking);
+        }
+        
+        // Display progress
+        switch (type) {
+            case "understanding":
+            case "intent":
+            case "progress":
+            case "success":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "complete":
+                // Show generated files
+                if (update.data != null) {
+                    String framework = update.data.has("framework") ? update.data.get("framework").getAsString() : "Unknown";
+                    String language = update.data.has("language") ? update.data.get("language").getAsString() : "Unknown";
+                    int filesCount = update.data.has("files_generated") ? update.data.get("files_generated").getAsInt() : 0;
+                    
+                    chatArea.append("\n" + "═".repeat(50) + "\n");
+                    chatArea.append("✅ Test Code Generated!\n");
+                    chatArea.append(String.format("   Framework: %s\n", framework));
+                    chatArea.append(String.format("   Language: %s\n", language));
+                    chatArea.append(String.format("   Files Created: %d\n", filesCount));
+                    chatArea.append(String.format("   Location: %s/generated_tests/\n", WORKSPACE_PATH));
+                    chatArea.append("═".repeat(50) + "\n\n");
+                    chatArea.append("💡 Tip: Check the generated_tests folder for your code!\n\n");
+                } else {
+                    chatArea.append("\n✅ " + message + "\n\n");
+                }
+                break;
+                
+            case "error":
+                chatArea.append("❌ " + message + "\n\n");
+                break;
+                
+            default:
+                chatArea.append(message + "\n");
+        }
+        
+        // Auto-scroll
+        chatArea.setCaretPosition(chatArea.getDocument().getLength());
     }
 
     private void updateContextLabel() {

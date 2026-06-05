@@ -25,7 +25,7 @@
     <depends>com.intellij.modules.java</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.bizom.scriptSherpa.ui.ScriptSherpaToolWindowFactory" 
+        <toolWindow factoryClass="com.bizom.scriptSherpa.ui.ScriptSherpaV3ToolWindowFactory" 
                    id="ScriptSherpa" 
                    anchor="right" 
                    secondary="false"/>
@@ -37,14 +37,14 @@
                class="com.bizom.scriptSherpa.actions.NavigateUIAction"
                text="Navigate UI"
                description="Navigate through app UI based on natural language">
-            <keyboard-shortcut keymap="$default" first-keystroke="cmd alt S"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="meta alt S"/>
         </action>
 
         <action id="ScriptSherpa.ExploreApp"
                class="com.bizom.scriptSherpa.actions.ExploreAppAction"
                text="Explore App"
                description="Explore app screens and collect locators">
-            <keyboard-shortcut keymap="$default" first-keystroke="cmd shift S"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="meta shift S"/>
         </action>
 
         <group id="ScriptSherpa.Menu" text="ScriptSherpa" description="ScriptSherpa Actions">

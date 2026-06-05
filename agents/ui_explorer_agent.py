@@ -1,7 +1,7 @@
 """
 UI Explorer Agent
 Intelligent agent that navigates through app flows and collects locators
-Uses Claude AI to understand user intent and guide navigation
+Uses AI to understand user intent and guide navigation
 """
 
 import json
@@ -10,7 +10,6 @@ import requests
 from typing import Dict, List, Optional
 from datetime import datetime
 import time
-import anthropic
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,7 +19,7 @@ load_dotenv()
 class UIExplorerAgent:
     """
     Intelligent UI Explorer that navigates based on user commands
-    Uses Claude AI to understand intent and guide navigation
+    Uses AI to understand intent and guide navigation
     Collects locators as it navigates
     """
     
@@ -31,7 +30,6 @@ class UIExplorerAgent:
         self.collected_locators = {}
         self.locator_ids = set()
         self.navigation_log = []
-        self.client = None
         self.use_groq = False
         self.use_ollama = False
         self.ollama_url = None
@@ -69,18 +67,7 @@ class UIExplorerAgent:
         except Exception as e:
             print(f"⚠️  Ollama connection failed: {e}")
         
-        # Fallback to Anthropic if Ollama fails (only if key is valid)
-        print("💡 Attempting fallback to Anthropic Claude API...")
-        try:
-            api_key = os.getenv('ANTHROPIC_API_KEY')
-            if api_key and not api_key.startswith("sk-ant-api03"):  # Generic exhausted key pattern
-                self.client = anthropic.Anthropic(api_key=api_key)
-                print("✅ Using Anthropic Claude API")
-                return
-        except Exception as e:
-            print(f"⚠️  Anthropic unavailable: {e}")
-        
-        print("❌ WARNING: No AI backend available! Both Ollama and Anthropic failed.")
+        print("❌ WARNING: No AI backend available. Ollama initialization failed.")
     
     def _check_appium_available(self) -> bool:
         """Check if Appium Python client is available"""
@@ -142,10 +129,22 @@ class UIExplorerAgent:
                     options.skip_server_installation = True
                 
                 # Connect to Appium server
-                self.driver = webdriver.Remote(
-                    'http://localhost:4723',
-                    options=options
-                )
+                appium_base_url = os.getenv('APPIUM_SERVER_URL', 'http://localhost:4723').strip().rstrip('/')
+                candidate_urls = [appium_base_url]
+                if not appium_base_url.endswith('/wd/hub'):
+                    candidate_urls.append(appium_base_url + '/wd/hub')
+
+                last_error = None
+                for candidate_url in candidate_urls:
+                    try:
+                        self.driver = webdriver.Remote(candidate_url, options=options)
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+
+                if self.driver is None:
+                    raise last_error or Exception('Unable to create Appium session')
                 
                 return {
                     "success": True,
@@ -167,6 +166,7 @@ class UIExplorerAgent:
                 "error": str(e),
                 "message": f"Failed to connect: {str(e)}",
                 "workaround": [
+                    "0. If Appium runs on a custom URL, set APPIUM_SERVER_URL in .env",
                     "1. Manually open your app on the emulator",
                     "2. Navigate to the screen you want to explore",
                     "3. Call explore-ui again - it will explore the current screen",
@@ -694,7 +694,7 @@ class UIExplorerAgent:
         Use AI to determine action and target element from step text
         """
         try:
-            if not self.use_ollama and not self.client:
+            if not self.use_ollama:
                 # Fallback to keyword matching
                 return self._get_action_by_keyword(step_text, ui_elements)
             
@@ -807,13 +807,13 @@ Respond in JSON format:
         Navigate with progress callbacks for real-time UI updates
         """
         # Same logic as navigate_based_on_intent but with progress updates
-        if not self.use_ollama and not self.client:
+        if not self.use_ollama:
             if progress_callback:
                 progress_callback('error', "❌ AI client not initialized")
             return {
                 "success": False,
                 "error": "AI client not initialized",
-                "message": "Neither Ollama nor Anthropic available"
+                "message": "Ollama is not available"
             }
         
         # Check if user is asking to execute test plan
@@ -890,11 +890,11 @@ Respond in JSON format:
         Also detects test plan execution requests
         """
         
-        if not self.use_ollama and not self.client:
+        if not self.use_ollama:
             return {
                 "success": False,
                 "error": "AI client not initialized",
-                "message": "Neither Ollama nor Anthropic available"
+                "message": "Ollama is not available"
             }
         
         # Check if user is asking to execute test plan
@@ -1104,13 +1104,13 @@ Respond in JSON format:
         }
     
     def _generate_navigation_steps(self, user_command: str, ui_elements: List[Dict]) -> Dict:
-        """Generate navigation steps using Ollama or Claude"""
+        """Generate navigation steps using Ollama."""
         
-        if not self.use_ollama and not self.client:
+        if not self.use_ollama:
             return {"error": "AI client not available"}
         
         # Format UI elements for prompt
-        ui_summary = self._format_ui_elements_for_claude(ui_elements)
+        ui_summary = self._format_ui_elements_for_ai(ui_elements)
         
         prompt = f"""You are a mobile app automation expert. Analyze the user's command and generate navigation steps.
 
@@ -1142,37 +1142,26 @@ Return as JSON with this structure:
 }}"""
 
         try:
-            if self.use_ollama:
-                # Using Ollama via HTTP with timeout (local or cloud)
-                try:
-                    response = requests.post(
-                        f'{self.ollama_url}/api/generate',
-                        json={
-                            'model': 'neural-chat',
-                            'prompt': prompt,
-                            'stream': False
-                        },
-                        timeout=30  # Short timeout
-                    )
-                    if response.status_code == 200:
-                        response_data = response.json()
-                        response_text = response_data.get('response', '')
-                    else:
-                        # Fallback to keyword matching
-                        return self._generate_steps_by_keyword_matching(user_command, ui_elements)
-                except (requests.Timeout, requests.ConnectionError):
+            # Using Ollama via HTTP with timeout (local or cloud)
+            try:
+                response = requests.post(
+                    f'{self.ollama_url}/api/generate',
+                    json={
+                        'model': 'neural-chat',
+                        'prompt': prompt,
+                        'stream': False
+                    },
+                    timeout=30  # Short timeout
+                )
+                if response.status_code == 200:
+                    response_data = response.json()
+                    response_text = response_data.get('response', '')
+                else:
                     # Fallback to keyword matching
                     return self._generate_steps_by_keyword_matching(user_command, ui_elements)
-            else:
-                # Using Anthropic API
-                message = self.client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1500,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                response_text = message.content[0].text
+            except (requests.Timeout, requests.ConnectionError):
+                # Fallback to keyword matching
+                return self._generate_steps_by_keyword_matching(user_command, ui_elements)
             
             # Extract JSON
             import re
@@ -1326,8 +1315,8 @@ Return as JSON with this structure:
         
         return True
     
-    def _format_ui_elements_for_claude(self, elements: List[Dict]) -> str:
-        """Format UI elements for Claude prompt"""
+    def _format_ui_elements_for_ai(self, elements: List[Dict]) -> str:
+        """Format UI elements for AI prompt"""
         
         if not elements:
             return "No UI elements found"

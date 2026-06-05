@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.bizom"
-version = "1.0.0"  // ScriptSherpa version
+version = "3.2.1-unified"  // Explicit current-file context messaging and safer plan handling.
 
 repositories {
     mavenCentral()
@@ -30,6 +30,6 @@ tasks {
     }
 
     buildPlugin {
-        archiveFileName.set("script-sherpa.zip")
+        archiveFileName.set("script-sherpa-v3.2.1-unified.zip")
     }
 }

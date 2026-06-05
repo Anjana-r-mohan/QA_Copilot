@@ -12,9 +12,10 @@ public class ScriptSherpaToolWindowFactory implements ToolWindowFactory {
 
     @Override
     public void createToolWindowContent(@NotNull Project project, @NotNull ToolWindow toolWindow) {
-        LOG.info("Creating ScriptSherpa Tool Window");
+        LOG.info("Creating ScriptSherpa Tool Window with Unified Chat");
         
-        ScriptSherpaPanel panel = new ScriptSherpaPanel(project);
+        // Use NEW unified chat panel - intelligent, no buttons needed!
+        UnifiedChatPanel panel = new UnifiedChatPanel(project);
         ContentFactory contentFactory = ContentFactory.getInstance();
         
         toolWindow.getContentManager().addContent(

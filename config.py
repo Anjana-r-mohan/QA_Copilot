@@ -5,8 +5,8 @@ load_dotenv()
 
 class Config:
     # LLM Configuration
-    ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
     
     # Database
     DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://localhost:5432/qa_copilot")

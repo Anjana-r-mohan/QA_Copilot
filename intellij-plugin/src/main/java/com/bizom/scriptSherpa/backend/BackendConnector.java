@@ -2,6 +2,7 @@ package com.bizom.scriptSherpa.backend;
 
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonArray;
 import com.intellij.openapi.diagnostic.Logger;
 import okhttp3.*;
 
@@ -19,6 +20,101 @@ public class BackendConnector {
         .readTimeout(600, java.util.concurrent.TimeUnit.SECONDS)  // 10 minutes for streaming
         .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .build();
+
+    /**
+     * NEW: Unified chat - handles ALL intents intelligently (navigate, generate, help, search)
+     * @param progressCallback Called for each progress update
+     */
+    public void sendUnifiedChatMessage(String message, String deviceName,
+                                       String appPackage, String appActivity,
+                                       String workspacePath,
+                                       Consumer<ProgressUpdate> progressCallback) throws IOException {
+        sendUnifiedChatMessage(
+            message,
+            deviceName,
+            appPackage,
+            appActivity,
+            workspacePath,
+            null,
+            null,
+            progressCallback
+        );
+    }
+
+    public void sendUnifiedChatMessage(String message, String deviceName,
+                                       String appPackage, String appActivity,
+                                       String workspacePath, String sessionId, ChatOptions options,
+                                       Consumer<ProgressUpdate> progressCallback) throws IOException {
+        LOG.info("🤖 Unified Chat: " + message);
+
+        JsonObject requestBody = new JsonObject();
+        requestBody.addProperty("message", message);
+        requestBody.addProperty("device_name", deviceName);
+        requestBody.addProperty("app_package", appPackage);
+        requestBody.addProperty("app_activity", appActivity);
+        requestBody.addProperty("workspace_path", workspacePath);
+        if (sessionId != null && !sessionId.trim().isEmpty()) {
+            requestBody.addProperty("session_id", sessionId);
+        }
+        if (options != null) {
+            if (options.agentType != null && !options.agentType.isEmpty()) {
+                requestBody.addProperty("agent_type", options.agentType);
+            }
+            if (options.model != null && !options.model.isEmpty()) {
+                requestBody.addProperty("model", options.model);
+            }
+            if (options.contextMode != null && !options.contextMode.isEmpty()) {
+                requestBody.addProperty("context_mode", options.contextMode);
+            }
+            if (options.attachedFiles != null && !options.attachedFiles.isEmpty()) {
+                JsonArray attached = new JsonArray();
+                for (String path : options.attachedFiles) {
+                    attached.add(path);
+                }
+                requestBody.add("attached_files", attached);
+            }
+        }
+
+        RequestBody body = RequestBody.create(
+            requestBody.toString(),
+            MediaType.parse("application/json")
+        );
+
+        Request request = new Request.Builder()
+            .url(API_URL + "/unified-chat")
+            .post(body)
+            .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IOException("API call failed: " + response.code());
+            }
+
+            // Read SSE stream
+            BufferedReader reader = new BufferedReader(new InputStreamReader(response.body().byteStream()));
+            String line;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data: ")) {
+                    String jsonData = line.substring(6);
+                    try {
+                        JsonObject event = JsonParser.parseString(jsonData).getAsJsonObject();
+                        String type = event.has("type") ? event.get("type").getAsString() : "unknown";
+                        String msg = event.has("message") ? event.get("message").getAsString() : "";
+
+                        ProgressUpdate update = new ProgressUpdate(type, msg, event);
+                        progressCallback.accept(update);
+
+                        if ("complete".equals(type) || "error".equals(type)) {
+                            break;
+                        }
+                    } catch (Exception e) {
+                        LOG.warn("Failed to parse SSE event: " + jsonData, e);
+                    }
+                }
+            }
+        }
+    }
 
     /**
      * Navigate UI with REAL-TIME SSE streaming for live progress updates
@@ -93,6 +189,81 @@ public class BackendConnector {
         }
     }
 
+    /**
+     * Generate test code using AI
+     * @param instruction User's natural language instruction
+     * @param testPlanPath Optional test plan file
+     * @param locatorsFile Optional locators file
+     * @param workspacePath Workspace for saving
+     * @param progressCallback Progress updates
+     */
+    public void generateTestCode(String instruction, String testPlanPath, 
+                                 String locatorsFile, String workspacePath,
+                                 Consumer<ProgressUpdate> progressCallback) throws IOException {
+        LOG.info("🚀 Generating test code: " + instruction);
+
+        JsonObject requestBody = new JsonObject();
+        requestBody.addProperty("instruction", instruction);
+        if (testPlanPath != null) {
+            requestBody.addProperty("test_plan_path", testPlanPath);
+        }
+        if (locatorsFile != null) {
+            requestBody.addProperty("locators_file", locatorsFile);
+        }
+        requestBody.addProperty("workspace_path", workspacePath);
+
+        RequestBody body = RequestBody.create(
+            requestBody.toString(),
+            MediaType.parse("application/json")
+        );
+
+        Request request = new Request.Builder()
+            .url(API_URL + "/generate-test-code")
+            .post(body)
+            .build();
+
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IOException("API call failed: " + response.code());
+            }
+
+            String responseBody = response.body().string();
+            JsonObject result = JsonParser.parseString(responseBody).getAsJsonObject();
+
+            // Send progress updates
+            if (result.has("framework")) {
+                progressCallback.accept(new ProgressUpdate(
+                    "intent",
+                    "📊 Detected: " + result.get("framework").getAsString() + 
+                    " with " + result.get("language").getAsString(),
+                    result
+                ));
+            }
+
+            if (result.has("saved_files")) {
+                int filesCount = result.getAsJsonArray("saved_files").size();
+                JsonObject completeData = new JsonObject();
+                completeData.addProperty("framework", result.get("framework").getAsString());
+                completeData.addProperty("language", result.get("language").getAsString());
+                completeData.addProperty("files_generated", filesCount);
+                
+                progressCallback.accept(new ProgressUpdate(
+                    "complete",
+                    "✅ Generated " + filesCount + " files",
+                    completeData
+                ));
+            }
+
+        } catch (Exception e) {
+            LOG.error("Code generation failed", e);
+            progressCallback.accept(new ProgressUpdate(
+                "error",
+                "Failed to generate code: " + e.getMessage(),
+                null
+            ));
+        }
+    }
+
     public NavigationResult navigateUI(String command, String deviceName, String appPackage, String appActivity, String workspacePath) throws IOException {
         LOG.info("Calling navigate-ui: " + command);
 
@@ -141,6 +312,20 @@ public class BackendConnector {
             this.type = type;
             this.message = message;
             this.data = data;
+        }
+    }
+
+    public static class ChatOptions {
+        public final String agentType;
+        public final String model;
+        public final String contextMode;
+        public final java.util.List<String> attachedFiles;
+
+        public ChatOptions(String agentType, String model, String contextMode, java.util.List<String> attachedFiles) {
+            this.agentType = agentType;
+            this.model = model;
+            this.contextMode = contextMode;
+            this.attachedFiles = attachedFiles;
         }
     }
 
