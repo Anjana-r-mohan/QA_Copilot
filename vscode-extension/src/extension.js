@@ -23,23 +23,15 @@ function activate(context) {
         vscode.commands.registerCommand('qaAgent.focus', () => {
             vscode.commands.executeCommand('qaAgent.chatView.focus');
         }),
-        vscode.commands.registerCommand('qaAgent.clearChat', () => {
-            if (agent) agent.clearHistory();
+        vscode.commands.registerCommand('qaAgent.clearChat', async () => {
+            if (agent) {
+                await agent.resetConversation(provider.getConfig());
+            }
             if (provider.webview) {
-                provider.webview.postMessage({ type: 'status', message: 'Chat cleared' });
+                provider.webview.postMessage({ type: 'chatCleared', message: 'Chat cleared' });
             }
         }),
-        vscode.commands.registerCommand('qaAgent.startBackend', () => {
-            const terminal = vscode.window.createTerminal('QaCoPilot Backend');
-            const config = vscode.workspace.getConfiguration('qaAgent');
-            const backendPath = config.get('backendPath', '');
-            if (backendPath) {
-                terminal.sendText(`cd "${backendPath}" && python api_server.py`);
-            } else {
-                terminal.sendText('echo "Set qaAgent.backendPath in settings to your QaCoPilot directory"');
-            }
-            terminal.show();
-        })
+        vscode.commands.registerCommand('qaAgent.startBackend', () => provider.startBackend())
     );
 
     context.subscriptions.push(outputChannel);
@@ -51,6 +43,8 @@ class QaAgentViewProvider {
         this.context = context;
         this.agent = agent;
         this.webview = null;
+        this.overrideAgentType = null;
+        this.overrideModel = null;
     }
 
     resolveWebviewView(webviewView) {
@@ -66,10 +60,23 @@ class QaAgentViewProvider {
         webviewView.webview.onDidReceiveMessage(async (message) => {
             switch (message.type) {
                 case 'message':
-                    await this.handleUserMessage(message.text);
+                    await this.handleUserMessage(message.text, message.attachedFiles, message.agentType, message.model);
                     break;
                 case 'clear':
-                    this.agent.clearHistory();
+                    await this.agent.resetConversation(this.getConfig());
+                    this.webview?.postMessage({ type: 'chatCleared', message: 'Conversation cleared and backend session reset' });
+                    break;
+                case 'startBackend':
+                    await this.startBackend();
+                    break;
+                case 'attachFile':
+                    await this.pickFile();
+                    break;
+                case 'setAgentType':
+                    this.overrideAgentType = message.value;
+                    break;
+                case 'setModel':
+                    this.overrideModel = message.value;
                     break;
             }
         });
@@ -82,8 +89,24 @@ class QaAgentViewProvider {
         });
     }
 
-    async handleUserMessage(text) {
+    async handleUserMessage(text, attachedFiles, agentType, model) {
         const config = this.getConfig();
+        if (agentType) config.agentType = agentType;
+        if (model) config.geminiModel = model;
+        if (attachedFiles && attachedFiles.length > 0) {
+            config.attachedFiles = attachedFiles;
+        }
+        // Also attach the currently open editor file if context mode is workspace
+        if (config.contextMode === 'workspace') {
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.document.uri.scheme === 'file') {
+                const currentFile = editor.document.uri.fsPath;
+                if (!config.attachedFiles) config.attachedFiles = [];
+                if (!config.attachedFiles.includes(currentFile)) {
+                    config.attachedFiles.push(currentFile);
+                }
+            }
+        }
 
         try {
             const result = await this.agent.processMessage(text, config, (type, message, data) => {
@@ -110,7 +133,10 @@ class QaAgentViewProvider {
         const folders = vscode.workspace.workspaceFolders;
         return {
             geminiApiKey: config.get('geminiApiKey', ''),
-            geminiModel: config.get('geminiModel', 'gemini-2.0-flash'),
+            geminiModel: config.get('geminiModel', 'gemini-3-flash-preview'),
+            autonomousMode: config.get('autonomousMode', true),
+            agentType: config.get('agentType', 'balanced'),
+            contextMode: config.get('contextMode', 'workspace'),
             javaPath: config.get('javaPath', 'java'),
             serverJar: config.get('serverJar', ''),
             appiumUrl: config.get('appiumUrl', 'http://127.0.0.1:4723'),
@@ -121,6 +147,41 @@ class QaAgentViewProvider {
             backendPath: config.get('backendPath', ''),
             workspacePath: folders && folders.length > 0 ? folders[0].uri.fsPath : '',
         };
+    }
+
+    async startBackend() {
+        const config = vscode.workspace.getConfiguration('qaAgent');
+        const backendPath = config.get('backendPath', '');
+        const terminal = vscode.window.createTerminal('QaCoPilot Backend');
+
+        if (backendPath) {
+            terminal.sendText(`cd "${backendPath}" && if command -v python >/dev/null 2>&1; then python api_server.py; else python3 api_server.py; fi`);
+            this.webview?.postMessage({ type: 'action', message: `Starting backend in terminal from ${backendPath}` });
+        } else {
+            terminal.sendText('echo "Set qaAgent.backendPath in settings to your QaCoPilot directory"');
+            this.webview?.postMessage({ type: 'warning', message: 'qaAgent.backendPath is not set. Configure it before starting the backend.' });
+        }
+
+        terminal.show();
+    }
+
+    async pickFile() {
+        const result = await vscode.window.showOpenDialog({
+            canSelectFiles: true,
+            canSelectFolders: false,
+            canSelectMany: true,
+            openLabel: 'Attach',
+            filters: {
+                'All Files': ['*'],
+                'Test Plans': ['md', 'txt', 'json', 'jsonl', 'csv'],
+                'Code': ['java', 'py', 'js', 'ts'],
+            }
+        });
+        if (result && result.length > 0) {
+            for (const uri of result) {
+                this.webview?.postMessage({ type: 'fileAttached', filePath: uri.fsPath });
+            }
+        }
     }
 }
 

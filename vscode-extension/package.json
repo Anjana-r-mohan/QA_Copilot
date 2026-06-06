@@ -43,8 +43,8 @@
         },
         "qaAgent.geminiModel": {
           "type": "string",
-          "default": "gemini-2.0-flash",
-          "enum": ["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
+          "default": "gemini-3-flash-preview",
+          "enum": ["gemini-3-flash-preview", "gemini-1.5-pro", "gemini-1.5-flash"],
           "description": "Gemini model to use"
         },
         "qaAgent.javaPath": {
@@ -86,6 +86,23 @@
           "type": "string",
           "default": "",
           "description": "Path to QaCoPilot directory (for Start Backend command)"
+        },
+        "qaAgent.autonomousMode": {
+          "type": "boolean",
+          "default": true,
+          "description": "Prefer the Python backend's session-based autonomous agent for chat, navigation, and test planning when available"
+        },
+        "qaAgent.agentType": {
+          "type": "string",
+          "default": "balanced",
+          "enum": ["balanced", "planner", "executor"],
+          "description": "Default backend agent behavior when autonomous mode is enabled"
+        },
+        "qaAgent.contextMode": {
+          "type": "string",
+          "default": "workspace",
+          "enum": ["workspace", "none"],
+          "description": "Context scope sent to the backend autonomous agent"
         }
       }
     }

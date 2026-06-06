@@ -861,6 +861,28 @@ async def unified_chat_endpoint(request: dict):
     return StreamingResponse(generate_response(), media_type="text/event-stream")
 
 
+@app.post("/api/unified-chat/reset-session")
+async def unified_chat_reset_session(request: dict):
+    """
+    Reset backend memory for a given unified-chat session.
+
+    Body:
+    {
+        "session_id": "required-session-id"
+    }
+    """
+    session_id = request.get('session_id')
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    removed = unified_chat_agent.reset_session(session_id)
+    return {
+        "success": True,
+        "session_id": session_id,
+        "cleared": bool(removed),
+    }
+
+
 @app.post("/mcp")
 async def mcp_endpoint(request: dict):
     """

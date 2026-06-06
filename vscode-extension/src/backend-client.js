@@ -42,6 +42,7 @@ class BackendClient {
             agent_type: options.agentType || 'balanced',
             model: options.model || undefined,
             context_mode: options.contextMode || 'workspace',
+            attached_files: options.attachedFiles || [],
         };
 
         return new Promise((resolve, reject) => {
@@ -74,8 +75,9 @@ class BackendClient {
                                 if (event.type === 'complete') {
                                     lastResult = event.result;
                                 } else if (event.type === 'error') {
-                                    reject(new Error(event.message));
-                                    return;
+                                    // Resolve with the error info so the UI can display it
+                                    // instead of rejecting (which causes unnecessary fallback)
+                                    lastResult = { error: event.message, details: event.data };
                                 } else {
                                     progressEvents.push(event);
                                     if (options.onProgress) {
@@ -97,6 +99,18 @@ class BackendClient {
             req.on('error', reject);
             req.write(JSON.stringify(body));
             req.end();
+        });
+    }
+
+    /**
+     * Clear backend memory for a unified chat session.
+     */
+    async resetUnifiedChatSession(sessionId) {
+        if (!sessionId) {
+            return { success: false, cleared: false };
+        }
+        return this._request('POST', '/api/unified-chat/reset-session', {
+            session_id: sessionId,
         });
     }
 

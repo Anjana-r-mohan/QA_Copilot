@@ -7,7 +7,7 @@ const https = require('https');
  * Falls back to direct Google API if backend is unavailable.
  */
 class GeminiClient {
-    constructor(apiKey, model = 'gemini-2.0-flash') {
+    constructor(apiKey, model = 'gemini-3-flash-preview') {
         this.apiKey = apiKey;
         this.model = model;
         this.backendUrl = 'http://localhost:8000';

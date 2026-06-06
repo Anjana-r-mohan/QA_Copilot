@@ -1,3 +1,4 @@
+const { randomUUID } = require('crypto');
 const { McpClient } = require('./mcp-client');
 const { GeminiClient } = require('./gemini-client');
 const { BackendClient } = require('./backend-client');
@@ -20,6 +21,7 @@ class QaAgent {
         this.lastSnapshot = '';
         this.connected = false;
         this.backendAvailable = false;
+        this.sessionId = randomUUID();
         this.onLog = null;
     }
 
@@ -71,6 +73,26 @@ class QaAgent {
 
         this.history.push({ role: 'user', content: userMessage });
 
+        this.backend.setBaseUrl(config.backendUrl || 'http://localhost:8000');
+        this.backendAvailable = await this.backend.isAvailable();
+
+        let intent = this._detectIntentHeuristic(userMessage);
+        if (this._shouldUseBackendAutonomy(intent, config)) {
+            progress('status', '🧠 Using autonomous backend agent...');
+            try {
+                return await this._handleAutonomousTurn(userMessage, intent, config, progress);
+            } catch (err) {
+                // If backend returned an actual error (not a connection failure), show it directly
+                if (this.backendAvailable) {
+                    this._log(`Backend returned error: ${err.message}`);
+                    return { type: 'error', message: err.message };
+                }
+                // Only fall back to local MCP if backend truly unreachable
+                this._log(`Backend unreachable, falling back to local MCP flow: ${err.message}`);
+                progress('status', '⚠️ Backend unreachable, switching to local agent...');
+            }
+        }
+
         // Ensure MCP is running
         if (!this.mcp.isRunning()) {
             try {
@@ -86,11 +108,10 @@ class QaAgent {
         const apiKey = config.geminiApiKey || this.gemini.apiKey || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || '';
         this.gemini.setApiKey(apiKey);
         this.gemini.setBackendUrl(config.backendUrl || 'http://localhost:8000');
-        this.gemini.setModel(config.geminiModel || 'gemini-2.0-flash');
+        this.gemini.setModel(config.geminiModel || 'gemini-3-flash-preview');
 
         // Detect intent
         progress('status', '🧠 Understanding your request...');
-        let intent = this._detectIntentHeuristic(userMessage);
         if (intent.intent === 'chat') {
             intent = await this.gemini.detectIntent(userMessage, this.lastSnapshot);
         }
@@ -124,38 +145,67 @@ class QaAgent {
     }
 
     /**
-     * Fast local intent detection for common agent actions.
-     * Prevents over-routing to chat and keeps Appium/MCP flows deterministic.
+     * Minimal local intent hint — only catches clear-cut fast-path intents.
+     * Everything else goes to the backend where Gemini does proper classification.
      */
     _detectIntentHeuristic(userMessage) {
         const text = (userMessage || '').toLowerCase();
 
-        if (/^\s*(help|what can you do|commands?)\b/.test(text)) {
+        if (/^\s*(help|what can you do)\s*[?]?\s*$/.test(text)) {
             return { intent: 'help' };
-        }
-        if (/\b(connect|device|emulator|attach)\b/.test(text)) {
-            return { intent: 'connect' };
         }
         if (/\b(screenshot|screen shot|capture screen)\b/.test(text)) {
             return { intent: 'screenshot' };
         }
-        if (/\b(explore|snapshot|what.?s on screen|scan screen)\b/.test(text)) {
-            return { intent: 'explore' };
-        }
-        if (/\b(test\s*plan|test\s*case|generate\s+tests?)\b/.test(text)) {
-            return { intent: 'test_plan' };
-        }
-        if (/\b(analy[sz]e\s+codebase|codebase\s+analysis|extract\s+locators?)\b/.test(text)) {
-            return { intent: 'analyze_codebase' };
-        }
-        if (/\b(tap|click|type|enter|scroll|swipe|navigate|open|go to|press back|long press|execute\s+steps?)\b/.test(text)) {
-            return { intent: 'navigate' };
-        }
-        if (/\b(generate\s+code|appium\s+code|page\s*object|automation\s+code)\b/.test(text)) {
-            return { intent: 'generate_code' };
+
+        // Let the backend (with Gemini) handle everything else
+        return { intent: 'chat' };
+    }
+
+    _shouldUseBackendAutonomy(intent, config) {
+        if (!this.backendAvailable || config.autonomousMode === false) {
+            return false;
         }
 
-        return { intent: 'chat' };
+        // Always route to backend when available — Gemini handles intent there
+        return true;
+    }
+
+    _agentTypeForIntent(intent) {
+        switch (intent.intent) {
+            case 'navigate':
+            case 'explore':
+                return 'executor';
+            case 'test_plan':
+            case 'analyze_codebase':
+                return 'planner';
+            default:
+                return 'balanced';
+        }
+    }
+
+    async _handleAutonomousTurn(userMessage, intent, config, progress) {
+        const result = await this.backend.unifiedChat(userMessage, {
+            sessionId: this.sessionId,
+            deviceName: config.deviceName,
+            appPackage: config.appPackage,
+            appActivity: config.appActivity,
+            workspacePath: config.workspacePath,
+            agentType: config.agentType || this._agentTypeForIntent(intent),
+            model: config.geminiModel,
+            contextMode: config.contextMode || 'workspace',
+            attachedFiles: config.attachedFiles || [],
+            onProgress: (type, message, data) => progress(type, message, data),
+        });
+
+        const response = this._formatBackendResult(result);
+        this.history.push({ role: 'assistant', content: response });
+
+        if (result.state?.locators_file) {
+            this.actionHistory.push(`locators: ${result.state.locators_file}`);
+        }
+
+        return { type: intent.intent, message: response, image: result.image };
     }
 
     // ── Intent Handlers ────────────────────────────────────────────
@@ -546,6 +596,54 @@ ${this.lastSnapshot ? `\nCurrent screen:\n${this.lastSnapshot}` : ''}`;
 
     // ── Helpers ─────────────────────────────────────────────────────
 
+    _formatBackendResult(result) {
+        if (!result || typeof result !== 'object') return String(result);
+
+        // Prefer human-readable fields
+        if (result.response) return result.response;
+        if (result.message) return result.message;
+
+        // Build readable text from structured data
+        const parts = [];
+
+        if (result.error) {
+            parts.push(`**Error:** ${result.error}`);
+            if (result.details) {
+                const d = String(result.details);
+                parts.push(d.length > 300 ? d.substring(0, 300) + '...' : d);
+            }
+            return parts.join('\n');
+        }
+
+        if (result.status) parts.push(result.status);
+        if (result.steps && Array.isArray(result.steps)) {
+            parts.push('**Steps executed:**');
+            result.steps.forEach((s, i) => {
+                parts.push(`${i + 1}. ${s.action || ''} ${s.xpath || s.selector || ''}${s.reason ? ' — ' + s.reason : ''}`);
+            });
+        }
+        if (result.test_plan || result.testPlan) {
+            parts.push(`**Test Plan:**\n${result.test_plan || result.testPlan}`);
+        }
+        if (result.code || result.generated_code) {
+            parts.push('```java\n' + (result.code || result.generated_code) + '\n```');
+        }
+        if (result.locators_collected) {
+            parts.push(`Collected **${result.locators_collected}** locators.`);
+        }
+        if (result.locators_file) {
+            parts.push(`Saved to: \`${result.locators_file.split('/').pop()}\``);
+        }
+        if (result.elements && Array.isArray(result.elements)) {
+            parts.push(`Found **${result.elements.length}** elements on screen.`);
+        }
+
+        if (parts.length > 0) return parts.join('\n');
+
+        // Last resort: formatted JSON in code block
+        return '```json\n' + JSON.stringify(result, null, 2) + '\n```';
+    }
+
     _extractText(mcpResult) {
         if (!mcpResult || !mcpResult.content) return '';
         const textPart = mcpResult.content.find(c => c.type === 'text');
@@ -560,10 +658,24 @@ ${this.lastSnapshot ? `\nCurrent screen:\n${this.lastSnapshot}` : ''}`;
         return new Promise(resolve => setTimeout(resolve, ms));
     }
 
+    async resetConversation(config) {
+        const previousSessionId = this.sessionId;
+        this.backend.setBaseUrl(config?.backendUrl || 'http://localhost:8000');
+
+        try {
+            await this.backend.resetUnifiedChatSession(previousSessionId);
+        } catch (err) {
+            this._log(`Backend session reset skipped: ${err.message}`);
+        }
+
+        this.clearHistory();
+    }
+
     clearHistory() {
         this.history = [];
         this.actionHistory = [];
         this.lastSnapshot = '';
+        this.sessionId = randomUUID();
     }
 
     dispose() {

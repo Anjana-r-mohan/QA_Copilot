@@ -45,8 +45,18 @@ if [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
+PYTHON_BIN=""
+if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+else
+    echo "❌ Python interpreter not found (python/python3)"
+    exit 1
+fi
+
 # Start server in background
-nohup python api_server.py > server.log 2>&1 &
+nohup "$PYTHON_BIN" api_server.py > server.log 2>&1 &
 
 NEW_PID=$!
 echo "✅ Server started (PID: $NEW_PID)"
