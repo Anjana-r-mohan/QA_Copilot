@@ -1960,7 +1960,7 @@ class UnifiedChatAgent:
                 url,
                 params={"key": self.gemini_api_key},
                 json=payload,
-                timeout=45,
+                timeout=20,
             )
             if response.status_code == 200:
                 data = response.json()
@@ -2031,7 +2031,7 @@ class UnifiedChatAgent:
                     "temperature": 0.2,
                     "messages": [{"role": "user", "content": prompt}],
                 },
-                timeout=45,
+                timeout=20,
             )
             if response.status_code == 200:
                 payload = response.json()
