@@ -6,12 +6,14 @@ REST API for use in IntelliJ or any IDE
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import os
 import sys
 import shutil
+import json
+import asyncio
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -26,11 +28,17 @@ from agents.ui_explorer_agent import UIExplorerAgent
 from agents.test_generator_agent import TestGeneratorAgent
 from agents.test_executor_agent import TestExecutorAgent
 from agents.ai_test_navigator_agent import AITestNavigatorAgent
+from agents.ai_code_generator_agent import AICodeGeneratorAgent
+from agents.unified_chat_agent import UnifiedChatAgent  # Unified chat agent with MCP
+
+# MCP Architecture
+from mcp.server import MCPServer
+from mcp.driver_manager import AppiumDriverManager
 
 app = FastAPI(
     title="QA Copilot API",
     description="AI-Powered QA Automation for Mobile Apps",
-    version="1.0.0"
+    version="2.0.0"  # Major version bump for unified chat
 )
 
 # Enable CORS for IntelliJ HTTP Client
@@ -49,6 +57,16 @@ ui_explorer = UIExplorerAgent()
 test_generator = TestGeneratorAgent()
 test_executor = TestExecutorAgent(ui_explorer)
 ai_navigator = AITestNavigatorAgent(ui_explorer)
+ai_code_generator = AICodeGeneratorAgent()
+
+# Initialize MCP Server with your new structure
+driver_manager = AppiumDriverManager()
+mcp_server = MCPServer(driver_manager=driver_manager, ui_explorer=ui_explorer)
+print("✅ MCP Server initialized with 4 tools")
+
+# Initialize TRUE unified chat agent with MCP server
+unified_chat_agent = UnifiedChatAgent(mcp_server=mcp_server)
+print("✅ Unified Chat Agent connected to MCP Server")
 
 
 class AnalyzeRequest(BaseModel):
@@ -446,11 +464,102 @@ async def execute_test_plan(request: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/navigate-ui-stream")
+async def navigate_ui_stream_endpoint(request: dict):
+    """
+    Stream navigation progress with real-time updates
+    Returns Server-Sent Events (SSE) stream
+    """
+    command = request.get('command')
+    device_name = request.get('device_name', '127.0.0.1:6555')
+    app_package = request.get('app_package', None)
+    app_activity = request.get('app_activity', None)
+    workspace_path = request.get('workspace_path', os.getcwd())
+    
+    if not command:
+        raise HTTPException(status_code=400, detail="command is required")
+    
+    async def generate_progress():
+        """Generate SSE stream with progress updates"""
+        try:
+            # Send initial understanding
+            yield f"data: {json.dumps({'type': 'understanding', 'message': f'🎯 I understand: {command}'})}\n\n"
+            
+            # Detect intent
+            user_command_lower = command.lower()
+            has_test_plan = any(kw in user_command_lower for kw in ['test plan', 'test case'])
+            
+            if has_test_plan:
+                yield f"data: {json.dumps({'type': 'intent', 'message': '📋 Detected: Test Plan Execution Mode'})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'intent', 'message': '🧭 Detected: Free-form Navigation Mode'})}\n\n"
+            
+            # Create progress callback
+            def send_progress(msg_type: str, message: str, data: dict = None):
+                event = {'type': msg_type, 'message': message}
+                if data:
+                    event.update(data)
+                # Store in queue for async iteration
+                progress_queue.put(json.dumps(event))
+            
+            # Execute with progress callback
+            import queue
+            progress_queue = queue.Queue()
+            
+            # Run navigation in thread to allow async streaming
+            import threading
+            result_container = {}
+            
+            def run_navigation():
+                try:
+                    result = ui_explorer.navigate_based_on_intent_with_progress(
+                        user_command=command,
+                        device_name=device_name,
+                        app_package=app_package,
+                        app_activity=app_activity,
+                        workspace_path=workspace_path,
+                        progress_callback=send_progress
+                    )
+                    result_container['result'] = result
+                    progress_queue.put(None)  # Signal completion
+                except Exception as e:
+                    result_container['error'] = str(e)
+                    progress_queue.put(None)
+            
+            nav_thread = threading.Thread(target=run_navigation)
+            nav_thread.start()
+            
+            # Stream progress updates
+            while True:
+                try:
+                    msg = progress_queue.get(timeout=1.0)
+                    if msg is None:  # Completion signal
+                        break
+                    yield f"data: {msg}\n\n"
+                except queue.Empty:
+                    # Send keepalive
+                    yield f"data: {json.dumps({'type': 'keepalive', 'message': '⏳ Processing...'})}\n\n"
+            
+            # Wait for thread to complete
+            nav_thread.join(timeout=10)
+            
+            # Send final result
+            if 'result' in result_container:
+                yield f"data: {json.dumps({'type': 'complete', 'result': result_container['result']})}\n\n"
+            elif 'error' in result_container:
+                yield f"data: {json.dumps({'type': 'error', 'message': result_container['error']})}\n\n"
+            
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': f'❌ {str(e)}'})}\n\n"
+    
+    return StreamingResponse(generate_progress(), media_type="text/event-stream")
+
+
 @app.post("/api/navigate-ui")
 async def navigate_ui(request: dict):
     """
     Intelligently navigate through UI based on user command
-    Uses Claude AI to understand intent and guide navigation
+    Uses AI to understand intent and guide navigation
     
     Body:
     {
@@ -458,7 +567,8 @@ async def navigate_ui(request: dict):
         "device_name": "127.0.0.1:6555",
         "app_package": "co.bizom.apps",
         "app_activity": ".android.MainActivity",
-        "workspace_path": "/path/to/workspace"
+        "workspace_path": "/path/to/workspace",
+        "stream": false  // Set to true for SSE streaming
     }
     """
     try:
@@ -467,11 +577,19 @@ async def navigate_ui(request: dict):
         app_package = request.get('app_package', None)
         app_activity = request.get('app_activity', None)
         workspace_path = request.get('workspace_path', os.getcwd())
+        stream = request.get('stream', False)
         
         if not command:
             raise HTTPException(status_code=400, detail="command is required")
         
-        # Try to use UI Explorer agent's intelligent navigation
+        # If streaming requested, use SSE endpoint
+        if stream:
+            return StreamingResponse(
+                navigate_ui_stream(command, device_name, app_package, app_activity, workspace_path),
+                media_type="text/event-stream"
+            )
+        
+        # Original non-streaming behavior
         try:
             result = ui_explorer.navigate_based_on_intent(
                 user_command=command,
@@ -510,19 +628,58 @@ async def navigate_ui(request: dict):
         raise HTTPException(status_code=500, detail=error_detail)
 
 
+async def navigate_ui_stream(command: str, device_name: str, app_package: str, 
+                             app_activity: str, workspace_path: str):
+    """
+    Stream navigation progress using Server-Sent Events (SSE)
+    Sends real-time updates as execution progresses
+    """
+    try:
+        # Send initial acknowledgment
+        yield f"data: {json.dumps({'type': 'start', 'message': f'🎯 Understanding your command: {command}'})}\n\n"
+        await asyncio.sleep(0.1)
+        
+        # Create progress callback
+        async def progress_callback(update_type: str, message: str, data: dict = None):
+            event_data = {
+                'type': update_type,
+                'message': message
+            }
+            if data:
+                event_data.update(data)
+            yield f"data: {json.dumps(event_data)}\n\n"
+            await asyncio.sleep(0.1)
+        
+        # Execute with progress updates
+        result = ui_explorer.navigate_based_on_intent(
+            user_command=command,
+            device_name=device_name,
+            app_package=app_package,
+            app_activity=app_activity,
+            workspace_path=workspace_path,
+            progress_callback=progress_callback
+        )
+        
+        # Send final result
+        yield f"data: {json.dumps({'type': 'complete', 'result': result})}\n\n"
+        
+    except Exception as e:
+        error_msg = str(e)
+        yield f"data: {json.dumps({'type': 'error', 'message': f'❌ Error: {error_msg}'})}\n\n"
+
+
 @app.post("/api/execute-test-plan-with-ai")
 async def execute_test_plan_with_ai(request: dict):
     """
     Execute test plan with AI-guided navigation
-    Uses Claude to understand test flow and intelligently navigate through app
+    Uses AI to understand test flow and intelligently navigate through app
     
     Body:
     {
         "test_plan_path": "test_plans/test_plan_sample.md",
         "device_name": "127.0.0.1:6555",
         "app_package": "co.bizom.apps",
-        "app_activity": ".android.MainActivity",
-        "anthropic_api_key": "sk-..." (optional, uses env var if not provided)
+        "app_activity": ".android.MainActivity"
     }
     """
     try:
@@ -532,14 +689,12 @@ async def execute_test_plan_with_ai(request: dict):
             device_name = request.get('device_name', '127.0.0.1:6555')
             app_package = request.get('app_package', None)
             app_activity = request.get('app_activity', None)
-            anthropic_api_key = request.get('anthropic_api_key', None)
         else:
             # Fallback for other request types
             test_plan_path = None
             device_name = '127.0.0.1:6555'
             app_package = None
             app_activity = None
-            anthropic_api_key = None
         
         if not test_plan_path:
             raise HTTPException(status_code=400, detail="test_plan_path is required")
@@ -563,6 +718,202 @@ async def execute_test_plan_with_ai(request: dict):
         import traceback
         error_detail = f"{str(e)}\n{traceback.format_exc()}"
         raise HTTPException(status_code=500, detail=error_detail)
+
+
+
+
+@app.post("/api/generate-test-code")
+async def generate_test_code(request: dict):
+    """
+    Generate test code using AI based on user instructions
+    
+    Body:
+    {
+        "instruction": "Generate Playwright tests in TypeScript",
+        "test_plan_path": "/path/to/test_plan.md",
+        "locators_file": "/path/to/locators.txt",
+        "workspace_path": "/path/to/workspace"
+    }
+    """
+    try:
+        instruction = request.get('instruction')
+        test_plan_path = request.get('test_plan_path')
+        locators_file = request.get('locators_file')
+        workspace_path = request.get('workspace_path', os.getcwd())
+        
+        if not instruction:
+            raise HTTPException(status_code=400, detail="instruction is required")
+        
+        # Generate code with AI
+        result = ai_code_generator.generate_test_code(
+            user_instruction=instruction,
+            test_plan_path=test_plan_path,
+            locators_file=locators_file,
+            workspace_path=workspace_path
+        )
+        
+        return result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        import traceback
+        error_detail = f"{str(e)}\n{traceback.format_exc()}"
+        raise HTTPException(status_code=500, detail=error_detail)
+
+
+@app.post("/api/unified-chat")
+async def unified_chat_endpoint(request: dict):
+    """
+    NEW: Unified chat endpoint - handles ALL user intents intelligently
+    One endpoint to rule them all!
+    
+    Body:
+    {
+        "message": "explore the app and generate Appium Java tests",
+        "session_id": "optional-session-id",
+        "device_name": "127.0.0.1:6555",
+        "app_package": "co.bizom.apps",
+        "app_activity": ".android.MainActivity",
+        "workspace_path": "/path/to/workspace"
+    }
+    
+    Returns SSE stream with intelligent responses
+    """
+    message = request.get('message')
+    session_id = request.get('session_id')
+    agent_type = request.get('agent_type', 'balanced')
+    model = request.get('model')
+    context_mode = request.get('context_mode', 'workspace')
+    attached_files = request.get('attached_files', [])
+    device_name = request.get('device_name', '127.0.0.1:6555')
+    app_package = request.get('app_package', None)
+    app_activity = request.get('app_activity', None)
+    workspace_path = request.get('workspace_path', os.getcwd())
+    
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    
+    async def generate_response():
+        """Generate SSE stream for chat response"""
+        try:
+            # Create progress callback
+            import queue
+            progress_queue = queue.Queue()
+            
+            def send_progress(msg_type: str, message: str, data: dict = None):
+                event = {'type': msg_type, 'message': message}
+                if data:
+                    event['data'] = data
+                progress_queue.put(json.dumps(event))
+            
+            # Process in thread
+            import threading
+            result_container = {}
+            
+            def run_agent():
+                try:
+                    result = unified_chat_agent.process_message(
+                        user_message=message,
+                        workspace_path=workspace_path,
+                        device_name=device_name,
+                        app_package=app_package,
+                        app_activity=app_activity,
+                        progress_callback=send_progress,
+                        session_id=session_id,
+                        agent_type=agent_type,
+                        model=model,
+                        context_mode=context_mode,
+                        attached_files=attached_files
+                    )
+                    result_container['result'] = result
+                    progress_queue.put(None)  # Signal completion
+                except Exception as e:
+                    result_container['error'] = str(e)
+                    progress_queue.put(None)
+            
+            agent_thread = threading.Thread(target=run_agent)
+            agent_thread.start()
+            
+            # Stream progress
+            while True:
+                try:
+                    msg = progress_queue.get(timeout=1.0)
+                    if msg is None:
+                        break
+                    yield f"data: {msg}\n\n"
+                except queue.Empty:
+                    yield f"data: {json.dumps({'type': 'keepalive', 'message': '⏳'})}\n\n"
+            
+            agent_thread.join(timeout=10)
+            
+            # Send final result
+            if 'result' in result_container:
+                if session_id and isinstance(result_container['result'], dict):
+                    result_container['result'].setdefault('session_id', session_id)
+                yield f"data: {json.dumps({'type': 'complete', 'result': result_container['result']})}\n\n"
+            elif 'error' in result_container:
+                yield f"data: {json.dumps({'type': 'error', 'message': result_container['error']})}\n\n"
+        
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(generate_response(), media_type="text/event-stream")
+
+
+@app.post("/api/unified-chat/reset-session")
+async def unified_chat_reset_session(request: dict):
+    """
+    Reset backend memory for a given unified-chat session.
+
+    Body:
+    {
+        "session_id": "required-session-id"
+    }
+    """
+    session_id = request.get('session_id')
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    removed = unified_chat_agent.reset_session(session_id)
+    return {
+        "success": True,
+        "session_id": session_id,
+        "cleared": bool(removed),
+    }
+
+
+@app.post("/mcp")
+async def mcp_endpoint(request: dict):
+    """
+    NEW: MCP Protocol Endpoint
+    Accepts standard MCP requests and returns MCP responses
+    
+    Body follows MCP protocol:
+    {
+        "id": "req-001",
+        "method": "callTool",
+        "params": {...},
+        "session_id": "session-123"
+    }
+    """
+    try:
+        from mcp.protocol import MCPRequest
+        
+        # Parse MCP request
+        mcp_request = MCPRequest.from_dict(request)
+        
+        # Handle via MCP server
+        mcp_response = mcp_server.handle_request(mcp_request)
+        
+        return mcp_response.to_dict()
+    
+    except Exception as e:
+        return {
+            "id": request.get('id', 'unknown'),
+            "success": False,
+            "error": str(e)
+        }
 
 
 if __name__ == "__main__":

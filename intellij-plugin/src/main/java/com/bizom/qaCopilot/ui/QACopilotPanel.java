@@ -1,11 +1,15 @@
 package com.bizom.qaCopilot.ui;
 
 import com.intellij.openapi.diagnostic.Logger;
+import com.intellij.openapi.progress.ProgressIndicator;
+import com.intellij.openapi.progress.ProgressManager;
+import com.intellij.openapi.progress.Task;
 import com.intellij.openapi.project.Project;
 import com.intellij.ui.components.JBPanel;
 import com.intellij.ui.components.JBScrollPane;
 import com.intellij.ui.components.JBTextArea;
 import com.bizom.qaCopilot.backend.BackendConnector;
+import org.jetbrains.annotations.NotNull;
 
 import javax.swing.*;
 import javax.swing.filechooser.FileNameExtensionFilter;
@@ -28,6 +32,9 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
     private static final String APP_PACKAGE = "co.bizom.apps";
     private static final String APP_ACTIVITY = ".android.MainActivity";
     private static final String WORKSPACE_PATH = "/Users/anjana.mohan/KMMAuto_demo";
+    
+    // Feature flags
+    private static final boolean USE_STREAMING = true;  // TRUE = Real-time SSE streaming!
 
     public QACopilotPanel(Project project) {
         this.project = project;
@@ -123,46 +130,205 @@ public class QACopilotPanel extends JBPanel<QACopilotPanel> {
     }
 
     private void processMessage(String message) throws Exception {
-        // Use hardcoded configuration (hidden from user)
-        BackendConnector.NavigationResult result = backendConnector.navigateUI(
-            message,
-            DEVICE_NAME,
-            APP_PACKAGE,
-            APP_ACTIVITY,
-            WORKSPACE_PATH
-        );
-        
-        String response = formatResponse(result);
-        
-        SwingUtilities.invokeLater(() -> {
-            // Remove thinking indicator
-            String current = chatArea.getText();
-            String withoutThinking = current.replace("🤖 QA Copilot is thinking...\n", "");
-            chatArea.setText(withoutThinking);
-            chatArea.append(response);
+        if (USE_STREAMING) {
+            // Try streaming first
+            processMessageWithStreaming(message);
+        } else {
+            // Use modal progress dialog as fallback
+            processMessageWithModal(message);
+        }
+    }
+    
+    private void processMessageWithStreaming(String message) {
+        // Use hardcoded configuration (hidden from user) with real-time streaming
+        new Thread(() -> {
+            try {
+                backendConnector.navigateUIWithProgress(
+                    message,
+                    DEVICE_NAME,
+                    APP_PACKAGE,
+                    APP_ACTIVITY,
+                    WORKSPACE_PATH,
+                    progressUpdate -> {
+                        // Handle each progress update in real-time
+                        SwingUtilities.invokeLater(() -> {
+                            handleProgressUpdate(progressUpdate);
+                        });
+                    }
+                );
+            } catch (Exception e) {
+                LOG.error("Streaming failed, falling back to modal", e);
+                // Fallback to modal on streaming failure
+                SwingUtilities.invokeLater(() -> {
+                    try {
+                        processMessageWithModal(message);
+                    } catch (Exception ex) {
+                        chatArea.append("❌ Error: " + ex.getMessage() + "\n\n");
+                    }
+                });
+            }
+        }).start();
+    }
+    
+    private void processMessageWithModal(String message) {
+        // Use IntelliJ's progress modal with background task
+        ProgressManager.getInstance().run(new Task.Backgroundable(project, "QA Copilot Processing...", true) {
+            private BackendConnector.NavigationResult result;
+            private StringBuilder progressLog = new StringBuilder();
+            
+            @Override
+            public void run(@NotNull ProgressIndicator indicator) {
+                try {
+                    indicator.setText("🎯 Understanding your command...");
+                    progressLog.append("🎯 Understanding: ").append(message).append("\n");
+                    Thread.sleep(500);
+                    
+                    // Use streaming endpoint but collect in modal
+                    backendConnector.navigateUIWithProgress(
+                        message,
+                        DEVICE_NAME,
+                        APP_PACKAGE,
+                        APP_ACTIVITY,
+                        WORKSPACE_PATH,
+                        progressUpdate -> {
+                            String msg = progressUpdate.message;
+                            progressLog.append(msg).append("\n");
+                            
+                            // Update progress indicator
+                            indicator.setText(msg);
+                            
+                            // Extract percentage if available
+                            if (progressUpdate.data != null) {
+                                if (progressUpdate.data.has("test_case_number") && progressUpdate.data.has("total_test_cases")) {
+                                    int current = progressUpdate.data.get("test_case_number").getAsInt();
+                                    int total = progressUpdate.data.get("total_test_cases").getAsInt();
+                                    double fraction = (double) current / total;
+                                    indicator.setFraction(fraction);
+                                }
+                            }
+                            
+                            // Check for cancellation
+                            if (indicator.isCanceled()) {
+                                throw new RuntimeException("User cancelled operation");
+                            }
+                        }
+                    );
+                    
+                } catch (Exception e) {
+                    LOG.error("Error in modal processing", e);
+                    progressLog.append("❌ Error: ").append(e.getMessage()).append("\n");
+                }
+            }
+            
+            @Override
+            public void onSuccess() {
+                SwingUtilities.invokeLater(() -> {
+                    // Remove thinking indicator
+                    String current = chatArea.getText();
+                    String withoutThinking = current.replace("🤖 QA Copilot is thinking...\n", "");
+                    chatArea.setText(withoutThinking);
+                    
+                    // Append all progress
+                    chatArea.append(progressLog.toString());
+                    chatArea.append("\n");
+                    
+                    // Auto-scroll
+                    chatArea.setCaretPosition(chatArea.getDocument().getLength());
+                });
+            }
+            
+            @Override
+            public void onThrowable(@NotNull Throwable error) {
+                SwingUtilities.invokeLater(() -> {
+                    chatArea.append("❌ Error: " + error.getMessage() + "\n\n");
+                });
+            }
         });
     }
 
-    private String formatResponse(BackendConnector.NavigationResult result) {
-        if (result.success) {
-            return String.format(
-                "✅ Navigation Complete!\n" +
-                "  Steps Executed: %d\n" +
-                "  Locators Collected: %d\n" +
-                "  Saved to: %s\n\n",
-                result.stepsExecuted,
-                result.locatorsCollected,
-                result.locatorsFile
-            );
-        } else {
-            // Provide helpful guidance even on failure
-            return "⚠️ Navigation encountered an issue.\n" +
-                   "Possible solutions:\n" +
-                   "  1. Ensure device is connected: adb devices\n" +
-                   "  2. Verify app is running on device\n" +
-                   "  3. Check API server is running\n" +
-                   "  4. Check logs for details\n\n";
+    private void handleProgressUpdate(BackendConnector.ProgressUpdate update) {
+        String type = update.type;
+        String message = update.message;
+        
+        // Remove "thinking" indicator on first real update
+        if ("understanding".equals(type) || "intent".equals(type)) {
+            String current = chatArea.getText();
+            String withoutThinking = current.replace("🤖 QA Copilot is thinking...\n", "");
+            chatArea.setText(withoutThinking);
         }
+        
+        // Display progress based on type
+        switch (type) {
+            case "understanding":
+            case "intent":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "progress":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "success":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "test_case_start":
+                chatArea.append("\n" + message + "\n");
+                break;
+                
+            case "step":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "elements_found":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "locators_update":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "warning":
+                chatArea.append(message + "\n");
+                break;
+                
+            case "error":
+                chatArea.append("❌ " + message + "\n\n");
+                break;
+                
+            case "complete":
+                // Final summary
+                if (update.data != null && update.data.has("result")) {
+                    com.google.gson.JsonObject result = update.data.getAsJsonObject("result");
+                    int steps = result.has("steps_executed") ? result.get("steps_executed").getAsInt() : 0;
+                    int locators = result.has("locators_collected") ? result.get("locators_collected").getAsInt() : 0;
+                    String file = result.has("locators_file") ? result.get("locators_file").getAsString() : "";
+                    
+                    chatArea.append("\n" + "═".repeat(50) + "\n");
+                    chatArea.append("✅ Navigation Complete!\n");
+                    chatArea.append(String.format("   Test Cases Executed: %d\n", steps));
+                    chatArea.append(String.format("   Locators Collected: %d\n", locators));
+                    chatArea.append(String.format("   Saved to: %s\n", file));
+                    chatArea.append("═".repeat(50) + "\n\n");
+                } else {
+                    chatArea.append("\n✅ " + message + "\n\n");
+                }
+                break;
+                
+            case "keepalive":
+                // Don't display keepalive messages, just keep connection alive
+                break;
+                
+            default:
+                chatArea.append(message + "\n");
+        }
+        
+        // Auto-scroll to bottom
+        chatArea.setCaretPosition(chatArea.getDocument().getLength());
+    }
+
+    private void formatResponse(BackendConnector.NavigationResult result) {
+        // Not used anymore - kept for compatibility
     }
 
     private void selectTestPlan() {

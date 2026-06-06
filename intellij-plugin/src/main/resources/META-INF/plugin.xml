@@ -1,46 +1,57 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <idea-plugin>
-    <id>com.bizom.qa-copilot</id>
-    <name>QA Copilot</name>
+    <id>com.bizom.scriptSherpa</id>
+    <name>ScriptSherpa</name>
     <vendor email="support@bizom.com" url="https://www.bizom.com">Bizom</vendor>
     <idea-version since-build="223" until-build="999.*"/>
     
     <description><![CDATA[
-        AI-powered QA automation for mobile apps.
-        Use natural language to navigate app UI, collect locators, and generate tests.
+        <h1>ScriptSherpa - Your AI Guide to Test Automation</h1>
+        <p>Navigate the automation journey with real-time visibility and intelligent guidance.</p>
+        
+        <h3>Key Features:</h3>
+        <ul>
+            <li><b>Real-Time Streaming</b> - Watch test execution with live progress updates</li>
+            <li><b>Smart Locator Collection</b> - Automatically gather UI elements (50-150+ per test plan)</li>
+            <li><b>Test Plan Execution</b> - Execute test cases step-by-step with full visibility</li>
+            <li><b>Intelligent Deduplication</b> - One consolidated file with unique locators</li>
+            <li><b>AI-Powered Navigation</b> - Natural language commands for app automation</li>
+        </ul>
+        
+        <p><i>ScriptSherpa - Guiding you through every step of the automation journey!</i></p>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>
     <depends>com.intellij.modules.java</depends>
 
     <extensions defaultExtensionNs="com.intellij">
-        <toolWindow factoryClass="com.bizom.qaCopilot.ui.QACopilotToolWindowFactory" 
-                   id="QA Copilot" 
+        <toolWindow factoryClass="com.bizom.scriptSherpa.ui.ScriptSherpaV3ToolWindowFactory" 
+                   id="ScriptSherpa" 
                    anchor="right" 
                    secondary="false"/>
-        <notificationGroup id="QA Copilot" displayType="BALLOON"/>
+        <notificationGroup id="ScriptSherpa" displayType="BALLOON"/>
     </extensions>
 
     <actions>
-        <action id="QACopilot.NavigateUI" 
-               class="com.bizom.qaCopilot.actions.NavigateUIAction"
+        <action id="ScriptSherpa.NavigateUI" 
+               class="com.bizom.scriptSherpa.actions.NavigateUIAction"
                text="Navigate UI"
                description="Navigate through app UI based on natural language">
-            <keyboard-shortcut keymap="$default" first-keystroke="cmd alt n"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="meta alt S"/>
         </action>
 
-        <action id="QACopilot.ExploreApp"
-               class="com.bizom.qaCopilot.actions.ExploreAppAction"
+        <action id="ScriptSherpa.ExploreApp"
+               class="com.bizom.scriptSherpa.actions.ExploreAppAction"
                text="Explore App"
                description="Explore app screens and collect locators">
-            <keyboard-shortcut keymap="$default" first-keystroke="cmd alt e"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="meta shift S"/>
         </action>
 
-        <group id="QACopilot.Menu" text="QA Copilot" description="QA Copilot Actions">
-            <action id="QACopilot.ShowChat" class="com.bizom.qaCopilot.actions.ShowChatAction"/>
+        <group id="ScriptSherpa.Menu" text="ScriptSherpa" description="ScriptSherpa Actions">
+            <action id="ScriptSherpa.ShowChat" class="com.bizom.scriptSherpa.actions.ShowChatAction"/>
             <separator/>
-            <reference id="QACopilot.NavigateUI"/>
-            <reference id="QACopilot.ExploreApp"/>
+            <reference id="ScriptSherpa.NavigateUI"/>
+            <reference id="ScriptSherpa.ExploreApp"/>
             <add-to-group group-id="ToolsMenu" anchor="last"/>
         </group>
     </actions>

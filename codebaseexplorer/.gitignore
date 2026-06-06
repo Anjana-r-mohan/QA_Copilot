@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment / secrets — NEVER commit these
+.env
+*.env
+.env.*
+
+# Output files (generated at runtime)
+pr-review/output/
+
+# Editors
+.DS_Store
+.idea/
+.vscode/
+*.swp

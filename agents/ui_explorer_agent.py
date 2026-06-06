@@ -1,7 +1,7 @@
 """
 UI Explorer Agent
 Intelligent agent that navigates through app flows and collects locators
-Uses Claude AI to understand user intent and guide navigation
+Uses AI to understand user intent and guide navigation
 """
 
 import json
@@ -10,7 +10,6 @@ import requests
 from typing import Dict, List, Optional
 from datetime import datetime
 import time
-import anthropic
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -20,7 +19,7 @@ load_dotenv()
 class UIExplorerAgent:
     """
     Intelligent UI Explorer that navigates based on user commands
-    Uses Claude AI to understand intent and guide navigation
+    Uses AI to understand intent and guide navigation
     Collects locators as it navigates
     """
     
@@ -31,7 +30,6 @@ class UIExplorerAgent:
         self.collected_locators = {}
         self.locator_ids = set()
         self.navigation_log = []
-        self.client = None
         self.use_groq = False
         self.use_ollama = False
         self.ollama_url = None
@@ -69,18 +67,7 @@ class UIExplorerAgent:
         except Exception as e:
             print(f"⚠️  Ollama connection failed: {e}")
         
-        # Fallback to Anthropic if Ollama fails (only if key is valid)
-        print("💡 Attempting fallback to Anthropic Claude API...")
-        try:
-            api_key = os.getenv('ANTHROPIC_API_KEY')
-            if api_key and not api_key.startswith("sk-ant-api03"):  # Generic exhausted key pattern
-                self.client = anthropic.Anthropic(api_key=api_key)
-                print("✅ Using Anthropic Claude API")
-                return
-        except Exception as e:
-            print(f"⚠️  Anthropic unavailable: {e}")
-        
-        print("❌ WARNING: No AI backend available! Both Ollama and Anthropic failed.")
+        print("❌ WARNING: No AI backend available. Ollama initialization failed.")
     
     def _check_appium_available(self) -> bool:
         """Check if Appium Python client is available"""
@@ -142,10 +129,22 @@ class UIExplorerAgent:
                     options.skip_server_installation = True
                 
                 # Connect to Appium server
-                self.driver = webdriver.Remote(
-                    'http://localhost:4723',
-                    options=options
-                )
+                appium_base_url = os.getenv('APPIUM_SERVER_URL', 'http://localhost:4723').strip().rstrip('/')
+                candidate_urls = [appium_base_url]
+                if not appium_base_url.endswith('/wd/hub'):
+                    candidate_urls.append(appium_base_url + '/wd/hub')
+
+                last_error = None
+                for candidate_url in candidate_urls:
+                    try:
+                        self.driver = webdriver.Remote(candidate_url, options=options)
+                        last_error = None
+                        break
+                    except Exception as exc:
+                        last_error = exc
+
+                if self.driver is None:
+                    raise last_error or Exception('Unable to create Appium session')
                 
                 return {
                     "success": True,
@@ -167,6 +166,7 @@ class UIExplorerAgent:
                 "error": str(e),
                 "message": f"Failed to connect: {str(e)}",
                 "workaround": [
+                    "0. If Appium runs on a custom URL, set APPIUM_SERVER_URL in .env",
                     "1. Manually open your app on the emulator",
                     "2. Navigate to the screen you want to explore",
                     "3. Call explore-ui again - it will explore the current screen",
@@ -527,17 +527,29 @@ class UIExplorerAgent:
 
     def execute_test_plan(self, test_plan_path: str, device_name: str = "127.0.0.1:6555",
                          app_package: str = None, app_activity: str = None,
-                         workspace_path: str = None) -> Dict:
+                         workspace_path: str = None, progress_callback=None) -> Dict:
         """
-        Execute test plan step-by-step, collecting locators for each test case
-        Generates separate locator file for each test case
+        Execute test plan step-by-step, collecting ALL unique locators across all test cases
+        Generates ONE locator file for the entire test plan with deduplication
+        
+        Args:
+            progress_callback: Optional function(msg_type, message, data) for progress updates
         """
         
+        def send_progress(msg_type: str, message: str, data: dict = None):
+            """Send progress update if callback provided"""
+            if progress_callback:
+                progress_callback(msg_type, message, data)
+            # Also print to console
+            if msg_type == 'progress':
+                print(message)
+        
         # Parse test plan
-        print(f"\n📋 Parsing test plan: {test_plan_path}")
+        send_progress('progress', f"📋 Parsing test plan: {test_plan_path}")
         parse_result = self._parse_test_plan(test_plan_path)
         
         if not parse_result.get('success'):
+            send_progress('error', f"❌ Failed to parse test plan: {parse_result.get('error')}")
             return {
                 "success": False,
                 "error": parse_result.get('error'),
@@ -545,54 +557,82 @@ class UIExplorerAgent:
             }
         
         test_cases = parse_result.get('test_cases', [])
-        print(f"✅ Found {len(test_cases)} test cases\n")
+        send_progress('success', f"✅ Found {len(test_cases)} test cases", {'total_test_cases': len(test_cases)})
         
         # Connect to device once
-        print(f"📱 Connecting to device: {device_name}")
+        send_progress('progress', f"📱 Connecting to device: {device_name}")
         connection = self.connect_to_emulator(device_name, app_package, app_activity)
         
         if not connection['success']:
+            send_progress('error', f"❌ Failed to connect: {connection.get('error')}")
             return {
                 'success': False,
                 'error': connection.get('error'),
                 'message': connection.get('message')
             }
         
-        print(f"✅ Connected to {device_name}\n")
+        send_progress('success', f"✅ Connected to {device_name}")
         
-        all_results = []
-        test_case_locator_files = []
+        # Initialize SINGLE locator collection for entire test plan
+        self.collected_locators = {}
+        self.locator_ids = set()
+        all_navigation_logs = []
         
-        # Execute each test case
+        # Execute each test case and accumulate locators
         for tc_idx, test_case in enumerate(test_cases, 1):
             tc_id = test_case.get('id', f'TC{tc_idx}')
             tc_title = test_case.get('title', f'Test Case {tc_idx}')
             steps = test_case.get('steps', [])
             
-            print(f"\n{'='*80}")
-            print(f"Executing {tc_id}: {tc_title}")
-            print(f"Total steps: {len(steps)}")
-            print(f"{'='*80}\n")
-            
-            # Reset locators for this test case
-            self.collected_locators = {}
-            self.locator_ids = set()
-            self.navigation_log = []
+            send_progress('test_case_start', 
+                         f"📝 Executing {tc_id}: {tc_title} ({tc_idx}/{len(test_cases)})",
+                         {
+                             'test_case_id': tc_id,
+                             'test_case_number': tc_idx,
+                             'total_test_cases': len(test_cases),
+                             'total_steps': len(steps),
+                             'locators_so_far': len(self.collected_locators)
+                         })
             
             # Execute each step
             for step_idx, step in enumerate(steps, 1):
-                print(f"Step {step_idx}: {step}")
+                send_progress('step', f"   Step {step_idx}/{len(steps)}: {step[:50]}...", 
+                            {'step_number': step_idx, 'total_steps': len(steps)})
                 
-                # Explore current screen
+                # Explore current screen and collect ALL elements
                 screen_result = self.explore_current_screen(f"{tc_id}_Step{step_idx}")
                 if not screen_result.get('success'):
-                    print(f"⚠️  Could not explore screen")
+                    send_progress('warning', f"   ⚠️  Could not explore screen")
                     continue
                 
                 current_elements = screen_result.get('elements', [])
-                print(f"   Found {len(current_elements)} UI elements")
+                send_progress('elements_found', f"   Found {len(current_elements)} UI elements",
+                            {'elements_count': len(current_elements)})
                 
-                # Use AI to determine action and target
+                # Add ALL unique elements from this screen to locators
+                new_locators_count = 0
+                for element in current_elements:
+                    # Create unique ID for this element
+                    element_id = element.get('resource_id') or element.get('text') or element.get('content_desc')
+                    if element_id and element_id not in self.locator_ids:
+                        self._add_locator(element, {
+                            'test_case': tc_id,
+                            'step': step_idx,
+                            'action': 'available',
+                            'description': step
+                        })
+                        new_locators_count += 1
+                
+                duplicates_skipped = len(current_elements) - new_locators_count
+                send_progress('locators_update', 
+                            f"   ✅ Added {new_locators_count} new locators (total: {len(self.collected_locators)})",
+                            {
+                                'new_locators': new_locators_count,
+                                'duplicates_skipped': duplicates_skipped,
+                                'total_locators': len(self.collected_locators)
+                            })
+                
+                # Now determine and execute action for this step
                 try:
                     action_plan = self._get_action_from_step(step, current_elements)
                     
@@ -600,15 +640,7 @@ class UIExplorerAgent:
                         target_element = action_plan['target_element']
                         action = action_plan.get('action', 'click')
                         
-                        print(f"   Action: {action}")
-                        print(f"   Target: {target_element.get('text') or target_element.get('resource_id')}")
-                        
-                        # Collect locator
-                        self._add_locator(target_element, {
-                            'step': step_idx,
-                            'action': action,
-                            'description': step
-                        })
+                        print(f"   🎯 Action: {action} on {target_element.get('text') or target_element.get('resource_id')}")
                         
                         # Execute action
                         try:
@@ -625,47 +657,35 @@ class UIExplorerAgent:
                 
                 except Exception as e:
                     print(f"   ⚠️  Error processing step: {str(e)}")
-            
-            # Save locators for this test case
-            if self.collected_locators:
-                locators_file = self._save_locators_to_workspace(
-                    workspace_path,
-                    f"{tc_id}_{tc_title}"
-                )
-                test_case_locator_files.append({
-                    'test_case': tc_id,
-                    'title': tc_title,
-                    'locators_file': locators_file,
-                    'locator_count': len(self.collected_locators)
-                })
-                print(f"\n✅ Saved {len(self.collected_locators)} locators for {tc_id}")
-            else:
-                print(f"\n⚠️  No locators collected for {tc_id}")
+        
+        # Save ALL collected locators to ONE file for the entire test plan
+        send_progress('progress', f"💾 Saving all {len(self.collected_locators)} unique locators to file...")
+        test_plan_name = os.path.basename(test_plan_path).replace('.md', '')
+        locators_file = self._save_locators_to_workspace(
+            workspace_path,
+            f"TestPlan_{test_plan_name}"
+        )
         
         # Disconnect
         self.disconnect()
         
-        print(f"\n{'='*80}")
-        print(f"✅ Test Plan Execution Complete!")
-        print(f"{'='*80}")
-        print(f"Test Cases Executed: {len(test_cases)}")
-        print(f"Locator Files Generated: {len(test_case_locator_files)}")
-        
-        # Calculate totals for plugin display
-        total_locators = sum(tc.get('locator_count', 0) for tc in test_case_locator_files)
-        all_locator_files = [tc.get('locators_file', '') for tc in test_case_locator_files]
-        locators_file_display = all_locator_files[0] if all_locator_files else ""
+        send_progress('complete', 
+                     f"✅ Test Plan Execution Complete! Collected {len(self.collected_locators)} unique locators",
+                     {
+                         'test_cases_executed': len(test_cases),
+                         'total_locators': len(self.collected_locators),
+                         'locators_file': locators_file
+                     })
         
         # Return format compatible with plugin expectations
         return {
             'success': True,
-            'command': user_command if 'user_command' in locals() else 'test plan execution',
+            'command': 'test plan execution',
             'steps_executed': len(test_cases),  # Plugin expects this key
-            'locators_collected': total_locators,  # Plugin expects this key
-            'locators_file': locators_file_display,  # Plugin expects this key
+            'locators_collected': len(self.collected_locators),  # Plugin expects this key
+            'locators_file': locators_file,  # Plugin expects this key
             'test_plan_path': test_plan_path,
             'test_cases_executed': len(test_cases),
-            'locator_files': test_case_locator_files,
             'total_test_cases': len(test_cases)
         }
 
@@ -674,7 +694,7 @@ class UIExplorerAgent:
         Use AI to determine action and target element from step text
         """
         try:
-            if not self.use_ollama and not self.client:
+            if not self.use_ollama:
                 # Fallback to keyword matching
                 return self._get_action_by_keyword(step_text, ui_elements)
             
@@ -779,6 +799,88 @@ Respond in JSON format:
         
         return None
     
+    
+    def navigate_based_on_intent_with_progress(self, user_command: str, device_name: str = "127.0.0.1:6555",
+                                               app_package: str = None, app_activity: str = None,
+                                               workspace_path: str = None, progress_callback=None) -> Dict:
+        """
+        Navigate with progress callbacks for real-time UI updates
+        """
+        # Same logic as navigate_based_on_intent but with progress updates
+        if not self.use_ollama:
+            if progress_callback:
+                progress_callback('error', "❌ AI client not initialized")
+            return {
+                "success": False,
+                "error": "AI client not initialized",
+                "message": "Ollama is not available"
+            }
+        
+        # Check if user is asking to execute test plan
+        user_command_lower = user_command.lower()
+        has_test_plan_keyword = any(keyword in user_command_lower for keyword in ['test plan', 'generated test', 'testplan', 'test case', 'test cases'])
+        has_test_plan_file = '[TEST_PLAN:' in user_command
+        
+        if has_test_plan_keyword or has_test_plan_file:
+            if progress_callback:
+                progress_callback('intent', "🎯 Detected: Test Plan Execution Mode")
+            
+            # Try to extract test plan path from metadata first
+            test_plan_path = None
+            if has_test_plan_file:
+                # Extract path from [TEST_PLAN: /path/to/file]
+                import re
+                match = re.search(r'\[TEST_PLAN:\s*([^\]]+)\]', user_command)
+                if match:
+                    test_plan_path = match.group(1).strip()
+                    if progress_callback:
+                        progress_callback('progress', f"📋 Found test plan: {os.path.basename(test_plan_path)}")
+            
+            # If no metadata, find latest test plan
+            if not test_plan_path:
+                if not workspace_path:
+                    workspace_path = os.getcwd()
+                
+                test_plans_dir = os.path.join(workspace_path, 'test_plans')
+                if not os.path.exists(test_plans_dir):
+                    if progress_callback:
+                        progress_callback('error', f"❌ Test plans directory not found: {test_plans_dir}")
+                    return {
+                        "success": False,
+                        "error": "Test plans directory not found",
+                        "message": f"No test plans directory at {test_plans_dir}"
+                    }
+                
+                # Get latest test plan
+                test_plans = sorted([f for f in os.listdir(test_plans_dir) if f.endswith('.md')])
+                if not test_plans:
+                    if progress_callback:
+                        progress_callback('error', f"❌ No test plans found in {test_plans_dir}")
+                    return {
+                        "success": False,
+                        "error": "No test plans found",
+                        "message": f"No markdown test plans in {test_plans_dir}"
+                    }
+                
+                test_plan_path = os.path.join(test_plans_dir, test_plans[-1])
+                if progress_callback:
+                    progress_callback('progress', f"📋 Using latest test plan: {os.path.basename(test_plan_path)}")
+            
+            # Execute test plan with progress
+            return self.execute_test_plan(
+                test_plan_path,
+                device_name,
+                app_package,
+                app_activity,
+                workspace_path,
+                progress_callback
+            )
+        
+        # For free-form navigation, use original method
+        return self.navigate_based_on_intent(
+            user_command, device_name, app_package, app_activity, workspace_path
+        )
+    
     def navigate_based_on_intent(self, user_command: str, device_name: str = "127.0.0.1:6555",
                                   app_package: str = None, app_activity: str = None,
                                   workspace_path: str = None) -> Dict:
@@ -788,11 +890,11 @@ Respond in JSON format:
         Also detects test plan execution requests
         """
         
-        if not self.use_ollama and not self.client:
+        if not self.use_ollama:
             return {
                 "success": False,
                 "error": "AI client not initialized",
-                "message": "Neither Ollama nor Anthropic available"
+                "message": "Ollama is not available"
             }
         
         # Check if user is asking to execute test plan
@@ -1002,13 +1104,13 @@ Respond in JSON format:
         }
     
     def _generate_navigation_steps(self, user_command: str, ui_elements: List[Dict]) -> Dict:
-        """Generate navigation steps using Ollama or Claude"""
+        """Generate navigation steps using Ollama."""
         
-        if not self.use_ollama and not self.client:
+        if not self.use_ollama:
             return {"error": "AI client not available"}
         
         # Format UI elements for prompt
-        ui_summary = self._format_ui_elements_for_claude(ui_elements)
+        ui_summary = self._format_ui_elements_for_ai(ui_elements)
         
         prompt = f"""You are a mobile app automation expert. Analyze the user's command and generate navigation steps.
 
@@ -1040,37 +1142,26 @@ Return as JSON with this structure:
 }}"""
 
         try:
-            if self.use_ollama:
-                # Using Ollama via HTTP with timeout (local or cloud)
-                try:
-                    response = requests.post(
-                        f'{self.ollama_url}/api/generate',
-                        json={
-                            'model': 'neural-chat',
-                            'prompt': prompt,
-                            'stream': False
-                        },
-                        timeout=30  # Short timeout
-                    )
-                    if response.status_code == 200:
-                        response_data = response.json()
-                        response_text = response_data.get('response', '')
-                    else:
-                        # Fallback to keyword matching
-                        return self._generate_steps_by_keyword_matching(user_command, ui_elements)
-                except (requests.Timeout, requests.ConnectionError):
+            # Using Ollama via HTTP with timeout (local or cloud)
+            try:
+                response = requests.post(
+                    f'{self.ollama_url}/api/generate',
+                    json={
+                        'model': 'neural-chat',
+                        'prompt': prompt,
+                        'stream': False
+                    },
+                    timeout=30  # Short timeout
+                )
+                if response.status_code == 200:
+                    response_data = response.json()
+                    response_text = response_data.get('response', '')
+                else:
                     # Fallback to keyword matching
                     return self._generate_steps_by_keyword_matching(user_command, ui_elements)
-            else:
-                # Using Anthropic API
-                message = self.client.messages.create(
-                    model="claude-3-5-sonnet-20241022",
-                    max_tokens=1500,
-                    messages=[
-                        {"role": "user", "content": prompt}
-                    ]
-                )
-                response_text = message.content[0].text
+            except (requests.Timeout, requests.ConnectionError):
+                # Fallback to keyword matching
+                return self._generate_steps_by_keyword_matching(user_command, ui_elements)
             
             # Extract JSON
             import re
@@ -1190,33 +1281,42 @@ Return as JSON with this structure:
         return best_match if best_score > 0 else None
     
     def _add_locator(self, element: Dict, step_info: Dict):
-        """Add locator to collection if not already present (deduplication)"""
+        """Add locator to collection if not already present (deduplication across entire test plan)"""
         
         if not element:
             return False
         
+        # Create unique ID for this element (resource_id is most reliable)
         locator_id = element.get('resource_id') or element.get('text') or element.get('accessibility_id')
         
+        # Skip if no valid ID or already collected
         if not locator_id or locator_id in self.locator_ids:
             return False
         
+        # Add to deduplication set
         self.locator_ids.add(locator_id)
+        
+        # Store comprehensive locator information
         self.collected_locators[locator_id] = {
             'resource_id': element.get('resource_id'),
             'xpath': element.get('xpath'),
             'accessibility_id': element.get('accessibility_id'),
             'text': element.get('text'),
+            'content_desc': element.get('content_desc'),
             'type': element.get('type'),
             'clickable': element.get('clickable'),
+            'enabled': element.get('enabled'),
+            'focusable': element.get('focusable'),
             'bounds': element.get('bounds'),
-            'step': step_info.get('step'),
-            'action': step_info.get('action')
+            'test_case': step_info.get('test_case', 'N/A'),  # Which test case found this
+            'step': step_info.get('step', 'N/A'),
+            'action': step_info.get('action', 'available')
         }
         
         return True
     
-    def _format_ui_elements_for_claude(self, elements: List[Dict]) -> str:
-        """Format UI elements for Claude prompt"""
+    def _format_ui_elements_for_ai(self, elements: List[Dict]) -> str:
+        """Format UI elements for AI prompt"""
         
         if not elements:
             return "No UI elements found"
@@ -1242,7 +1342,7 @@ Return as JSON with this structure:
         return "\n".join(formatted)
     
     def _save_locators_to_workspace(self, workspace_path: str = None, user_command: str = "") -> str:
-        """Save collected locators to workspace folder"""
+        """Save collected locators to workspace folder with comprehensive information"""
         
         if not workspace_path:
             workspace_path = os.getcwd()
@@ -1254,7 +1354,7 @@ Return as JSON with this structure:
         # Generate filename from command
         if user_command:
             # Clean command for filename
-            filename_base = "".join(c if c.isalnum() else "_" for c in user_command[:30])
+            filename_base = "".join(c if c.isalnum() else "_" for c in user_command[:50])
         else:
             filename_base = "explored_ui"
         
@@ -1262,14 +1362,16 @@ Return as JSON with this structure:
         output_file = os.path.join(locators_dir, f"{filename_base}_{timestamp}_locators.txt")
         
         with open(output_file, 'w', encoding='utf-8') as f:
-            f.write(f"# Locators from: {user_command}\n")
+            f.write(f"# UI Element Locators\n")
+            f.write(f"# Source: {user_command}\n")
             f.write(f"# Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"# Total unique locators: {len(self.collected_locators)}\n")
+            f.write(f"# Total Unique Elements: {len(self.collected_locators)}\n")
+            f.write(f"# Deduplication: Applied across all test cases\n")
             f.write("\n" + "="*80 + "\n\n")
             
             for idx, (locator_id, locator) in enumerate(self.collected_locators.items(), 1):
                 f.write(f"{idx}. {locator_id}\n")
-                f.write(f"   Type: {locator.get('type')}\n")
+                f.write(f"   Element Type: {locator.get('type', 'Unknown')}\n")
                 
                 if locator.get('resource_id'):
                     f.write(f"   Resource ID: {locator['resource_id']}\n")
@@ -1280,12 +1382,21 @@ Return as JSON with this structure:
                 if locator.get('accessibility_id'):
                     f.write(f"   Accessibility ID: {locator['accessibility_id']}\n")
                 
+                if locator.get('content_desc'):
+                    f.write(f"   Content Description: {locator['content_desc']}\n")
+                
                 if locator.get('text'):
                     f.write(f"   Text: {locator['text']}\n")
                 
-                f.write(f"   Clickable: {locator.get('clickable')}\n")
-                f.write(f"   Step used: {locator.get('step')}\n")
-                f.write(f"   Action: {locator.get('action')}\n")
+                if locator.get('bounds'):
+                    f.write(f"   Bounds: {locator['bounds']}\n")
+                
+                f.write(f"   Clickable: {locator.get('clickable', False)}\n")
+                f.write(f"   Enabled: {locator.get('enabled', False)}\n")
+                f.write(f"   Focusable: {locator.get('focusable', False)}\n")
+                f.write(f"   Found in Test Case: {locator.get('test_case', 'N/A')}\n")
+                f.write(f"   Step: {locator.get('step', 'N/A')}\n")
+                f.write(f"   Usage: {locator.get('action', 'available')}\n")
                 f.write("\n" + "-"*80 + "\n\n")
         
         print(f"✅ Locators saved to: {output_file}")
