@@ -164,7 +164,7 @@ class UnifiedChatAgent:
         send_progress("intent", f"💡 Intent: {intent['type']} - {intent['description']}")
 
         if intent["type"] == "help":
-            response = self._help_text()
+            response = self._help_text(session)
             session["history"].append({"role": "assistant", "content": response})
             send_progress("chat_response", response)
             return {
@@ -278,6 +278,20 @@ class UnifiedChatAgent:
                 "state": self._session_state(session),
             }
 
+        if intent["type"] == "analyze_pr":
+            return self._handle_analyze_pr(
+                intent=intent,
+                session=session,
+                user_message=user_message,
+                workspace_path=workspace_path,
+                send_progress=send_progress,
+                sid=sid,
+                device_name=device_name,
+                app_package=app_package,
+                app_activity=app_activity,
+                attachment_context=attachment_context,
+            )
+
         if intent["type"] == "general_chat":
             response = self._dynamic_chat_response(user_message, session, attachment_context)
             session["history"].append({"role": "assistant", "content": response})
@@ -358,12 +372,19 @@ class UnifiedChatAgent:
                 else:
                     send_progress("progress", "ℹ️ No machine-applied precondition change detected; continuing without relaunch")
 
+            # Scale execution budget when plan steps are loaded (e.g. from PR analysis)
+            plan_steps = session.get("plan_steps") or []
+            base_max = intent.get("max_steps", self._steps_for_agent_type(session.get("agent_type", "balanced")))
+            if plan_steps:
+                base_max = min(80, max(base_max, len(plan_steps) * 3))
+                send_progress("progress", f"🧮 Execution budget set to {base_max} steps for {len(plan_steps)} plan steps")
+
             exploration = self._run_agent_loop(
                 session=session,
                 user_message=user_message,
                 workspace_path=workspace_path,
                 send_progress=send_progress,
-                max_steps=intent.get("max_steps", self._steps_for_agent_type(session.get("agent_type", "balanced"))),
+                max_steps=base_max,
                 attachment_context=attachment_context,
             )
 
@@ -383,7 +404,7 @@ class UnifiedChatAgent:
                             user_message=user_message,
                             workspace_path=workspace_path,
                             send_progress=send_progress,
-                            max_steps=intent.get("max_steps", self._steps_for_agent_type(session.get("agent_type", "balanced"))),
+                            max_steps=base_max,
                             attachment_context=attachment_context,
                         )
 
@@ -446,8 +467,13 @@ class UnifiedChatAgent:
             send_progress("chat_response", completion_response)
 
             if intent["type"] == "navigate_and_generate":
-                if failed_steps:
-                    send_progress("warning", f"⚠️ Skipping test generation — {len(failed_steps)} step(s) failed validation")
+                # Only skip code gen if the vast majority of steps failed
+                # (e.g. >60% failed AND fewer than 2 passed) — otherwise generate anyway
+                total_validated = len(final_by_step)
+                passed_count = sum(1 for r in final_by_step.values() if r.get("passed"))
+                fail_rate = len(failed_steps) / max(total_validated, 1)
+                if failed_steps and fail_rate > 0.6 and passed_count < 2:
+                    send_progress("warning", f"⚠️ Skipping test generation — {len(failed_steps)}/{total_validated} step(s) failed validation")
                     fail_summary = self._llm_explain_skip_codegen(session, failed_steps)
                     send_progress("chat_response", fail_summary)
                     result = {
@@ -461,6 +487,8 @@ class UnifiedChatAgent:
                     }
                     self._store_assistant_summary(session, result)
                     return result
+                elif failed_steps:
+                    send_progress("progress", f"ℹ️ {len(failed_steps)} step(s) failed but {passed_count} passed — proceeding with code generation")
 
                 generation = self._generate_tests_from_locators(
                     session=session,
@@ -597,11 +625,50 @@ class UnifiedChatAgent:
     def _detect_intent(self, message: str, session: Dict) -> Dict:
         message_lower = message.lower().strip()
 
-        # Quick followup check
-        followup_words = {"continue", "continuw", "contine", "continuee", "next", "go on", "proceed", "keep going", "retry", "skip", "skip and continue"}
+        # Quick followup check — includes affirmative replies like "yes", "sure", "ok"
+        followup_words = {"continue", "continuw", "contine", "continuee", "next", "go on", "proceed",
+                          "keep going", "retry", "skip", "skip and continue",
+                          "yes", "yeah", "yep", "yea", "sure", "ok", "okay", "do it", "go ahead",
+                          "go for it", "let's go", "lets go", "please", "absolutely", "definitely"}
         if any(word in message_lower for word in followup_words):
             prev = session.get("last_intent")
             prev_obj = session.get("last_objective", "")
+            # If last intent was analyze_pr, user saying "yes" means execute + generate
+            if prev == "analyze_pr" and prev_obj:
+                session["last_intent"] = "navigate_and_generate"
+                # Reload plan steps from the saved test plan file
+                test_plan_path = (session.get("last_result") or {}).get("test_plan_path", "")
+                if test_plan_path and os.path.isfile(test_plan_path):
+                    try:
+                        with open(test_plan_path, "r", encoding="utf-8") as f:
+                            plan_content = f.read()
+                        reloaded_steps = self._extract_plan_steps(plan_content)
+                        if reloaded_steps:
+                            session["plan_steps"] = reloaded_steps
+                            session["current_plan_step"] = 0
+                            session["plan_search_attempts"] = {}
+                            session["step_results"] = []
+                            session["visited_xpaths"] = set()
+                            session["saved_locator_keys"] = set()
+                            session["expected_outcomes"] = self._extract_expected_outcomes(plan_content)
+                    except Exception:
+                        pass
+                else:
+                    # No file — at least reset the plan counter so steps replay
+                    session["current_plan_step"] = 0
+                    session["plan_search_attempts"] = {}
+                    session["step_results"] = []
+                    session["visited_xpaths"] = set()
+                    session["saved_locator_keys"] = set()
+                result = {
+                    "type": "navigate_and_generate",
+                    "description": f"Continue execution from PR analysis: {prev_obj}",
+                    "max_steps": self._steps_for_agent_type(session.get("agent_type", "balanced")),
+                    "framework": self._extract_framework(prev_obj),
+                    "language": self._extract_language(prev_obj),
+                    "structure": self._extract_structure(prev_obj),
+                }
+                return result
             if prev in {"navigate", "navigate_and_generate"}:
                 result = {
                     "type": prev,
@@ -631,6 +698,27 @@ class UnifiedChatAgent:
         if "help" in message_lower and len(message_lower) < 20:
             return {"type": "help", "description": "Show capabilities"}
 
+        # ── URL-based intent detection (Bugzilla / Bitbucket PR links) ──
+        import re as _re
+        bugzilla_match = _re.search(r'https://bugzilla\.[^\s]+show_bug\.cgi\?id=\d+', message)
+        bitbucket_pr_match = _re.search(r'https://bitbucket\.org/[^\s]+/pull-requests/\d+', message)
+        if bugzilla_match or bitbucket_pr_match:
+            url = (bugzilla_match or bitbucket_pr_match).group(0)
+            session["last_intent"] = "analyze_pr"
+            session["last_objective"] = message
+            # Check if user also wants to execute + generate
+            wants_execute = any(kw in message_lower for kw in ["execute", "run", "test", "emulator", "generate", "java", "maven"])
+            return {
+                "type": "analyze_pr",
+                "description": f"Analyze PR/bug and generate test plan from {url}",
+                "pr_url": url,
+                "chain_execute": wants_execute,
+                "framework": self._extract_framework(message),
+                "language": self._extract_language(message),
+                "structure": self._extract_structure(message),
+                "max_steps": self._steps_for_agent_type(session.get("agent_type", "balanced")),
+            }
+
         # ── LLM-powered intent detection (with retry) ──
         llm_intent = self._detect_intent_with_llm(message, session)
         if not llm_intent:
@@ -640,7 +728,20 @@ class UnifiedChatAgent:
         if llm_intent:
             return llm_intent
 
-        # LLM unavailable — default to navigate_and_generate for action-like messages
+        # LLM unavailable — keyword-based fallback
+        if any(kw in message_lower for kw in ["bugzilla", "bitbucket", "pull request", "pr link", "analyze pr", "analyze bug"]):
+            session["last_intent"] = "analyze_pr"
+            session["last_objective"] = message
+            wants_execute = any(kw in message_lower for kw in ["execute", "run", "test", "emulator", "generate", "java", "maven"])
+            return {
+                "type": "analyze_pr",
+                "description": "Analyze PR/bug (LLM unavailable, keyword match)",
+                "chain_execute": wants_execute,
+                "framework": self._extract_framework(message),
+                "language": self._extract_language(message),
+                "structure": self._extract_structure(message),
+                "max_steps": self._steps_for_agent_type(session.get("agent_type", "balanced")),
+            }
         if any(kw in message_lower for kw in ["test", "execute", "explore", "generate", "run", "plan", "locator"]):
             session["last_intent"] = "navigate_and_generate"
             session["last_objective"] = message
@@ -676,6 +777,7 @@ class UnifiedChatAgent:
             "- **navigate** — interact with the app (tap buttons, scroll, go through flows) but no code\n"
             "- **navigate_and_generate** — run through the app AND write test code afterward (this is the most common one)\n"
             "- **generate_code** — write test code from locators we already captured\n"
+            "- **analyze_pr** — analyze a Bugzilla bug or Bitbucket PR link to generate a test plan from code changes\n"
             "- **general_chat** — they're just asking a question, not requesting an action\n\n"
             "Which one fits best? Just tell me naturally — mention the intent name somewhere in your answer."
         )
@@ -690,6 +792,7 @@ class UnifiedChatAgent:
         # Scan the response for intent keywords — order matters (most specific first)
         intent_type = None
         intent_priorities = [
+            "analyze_pr",
             "navigate_and_generate",
             "generate_code",
             "navigate",
@@ -706,6 +809,8 @@ class UnifiedChatAgent:
             clues = response.strip().lower()
             if any(w in clues for w in ["execute", "run", "test plan", "generate", "java", "maven"]):
                 intent_type = "navigate_and_generate"
+            elif any(w in clues for w in ["bugzilla", "pr link", "pull request", "analyze pr", "bitbucket"]):
+                intent_type = "analyze_pr"
             elif any(w in clues for w in ["tap", "click", "scroll", "interact"]):
                 intent_type = "navigate"
             elif any(w in clues for w in ["look at", "see what", "read", "screen"]):
@@ -715,7 +820,7 @@ class UnifiedChatAgent:
             else:
                 intent_type = "navigate_and_generate"  # safe default
 
-        valid_intents = {"connect", "explore", "navigate", "navigate_and_generate", "generate_code", "general_chat"}
+        valid_intents = {"connect", "explore", "navigate", "navigate_and_generate", "generate_code", "analyze_pr", "general_chat"}
 
         result = {"type": intent_type, "description": description}
 
@@ -735,6 +840,13 @@ class UnifiedChatAgent:
         if intent_type == "explore":
             session["last_intent"] = "explore"
             session["last_objective"] = message
+        if intent_type == "analyze_pr":
+            session["last_intent"] = "analyze_pr"
+            session["last_objective"] = message
+            result["framework"] = self._extract_framework(message)
+            result["language"] = self._extract_language(message)
+            result["structure"] = self._extract_structure(message)
+            result["max_steps"] = self._steps_for_agent_type(session.get("agent_type", "balanced"))
 
         return result
 
@@ -812,7 +924,10 @@ class UnifiedChatAgent:
         attachment_context: str,
     ) -> Dict:
         objective = user_message
-        if any(token in user_message.lower() for token in ["continue", "next", "go on"]):
+        # For affirmative/continuation replies, use the original objective
+        affirmative_tokens = ["continue", "next", "go on", "yes", "yeah", "yep", "sure",
+                              "ok", "okay", "do it", "go ahead", "proceed", "retry"]
+        if any(token in user_message.lower() for token in affirmative_tokens):
             objective = session.get("last_objective") or user_message
 
         locators_file = session.get("locators_file") or self._prepare_locators_file(workspace_path, objective)
@@ -834,8 +949,32 @@ class UnifiedChatAgent:
 
         for idx in range(1, max_steps + 1):
             current_plan_step = self._current_plan_step_text(session)
+            # Check if all plan steps are done
+            plan_steps = session.get("plan_steps") or []
+            if plan_steps and session.get("current_plan_step", 0) >= len(plan_steps):
+                send_progress("success", f"✅ All {len(plan_steps)} plan steps completed")
+                break
             if current_plan_step:
                 send_progress("progress", f"🪜 Target step: {current_plan_step}")
+
+            # Auto-advance verification-only steps — read screen and record pass, no UI interaction needed
+            if current_plan_step and self._is_verification_only_step(current_plan_step):
+                screen_data = self.mcp_server.call_tool("explore_screen", {})
+                elements = screen_data.get("elements", []) if screen_data.get("success") else []
+                last_elements = elements
+                new_locators = self._save_screen_locators(session, locators_file, elements)
+                locators_collected += new_locators
+                # Record verification as auto-passed
+                step_idx = session.get("current_plan_step", 0)
+                session.setdefault("step_results", []).append({
+                    "step_index": step_idx + 1,
+                    "step": current_plan_step,
+                    "passed": True,
+                    "reason": f"Verification auto-passed — screen has {len(elements)} elements",
+                })
+                session["current_plan_step"] = step_idx + 1
+                send_progress("success", f"✅ Verification passed: {current_plan_step[:80]}")
+                continue
 
             screen_data = self.mcp_server.call_tool("explore_screen", {})
             if not screen_data.get("success"):
@@ -881,12 +1020,30 @@ class UnifiedChatAgent:
                     send_progress("progress", "♻️ Recovered with fallback strategy")
 
             if not action_result.get("success"):
-                action_failed = True
                 action_error = action_result.get("error", "unknown error")
                 send_progress("warning", f"⚠️ Action failed: {action_error}")
-                if current_plan_step:
-                    send_progress("warning", f"⚠️ Blocked while executing plan step: {current_plan_step}")
-                break
+                # If we have plan steps, skip this step and continue instead of breaking
+                plan_steps = session.get("plan_steps") or []
+                if plan_steps and current_plan_step:
+                    cur_idx = session.get("current_plan_step", 0)
+                    session.setdefault("step_results", []).append({
+                        "step_index": cur_idx + 1,
+                        "step": current_plan_step,
+                        "passed": False,
+                        "reason": f"Action failed: {action_error[:100]}",
+                    })
+                    next_idx = cur_idx + 1
+                    if next_idx < len(plan_steps):
+                        session["current_plan_step"] = next_idx
+                        session.get("plan_search_attempts", {}).pop(str(next_idx), None)
+                        send_progress("progress", f"⏭️ Skipping to next step: {plan_steps[next_idx][:60]}")
+                        continue
+                    else:
+                        send_progress("progress", "📋 All plan steps attempted")
+                        break
+                else:
+                    action_failed = True
+                    break
 
             if next_action.get("xpath"):
                 session["visited_xpaths"].add(next_action["xpath"])
@@ -1102,27 +1259,37 @@ class UnifiedChatAgent:
                     "from_plan": True,
                 }
 
-            # If screen is sparse, prefer trying one unseen clickable rather than over-scrolling.
-            if len(elements) <= 4:
-                for element in elements:
-                    xpath = element.get("xpath")
-                    if element.get("clickable") and xpath and xpath not in session["visited_xpaths"]:
-                        return {
-                            "action": "click",
-                            "xpath": xpath,
-                            "reason": "sparse screen fallback candidate",
-                            "from_plan": True,
-                        }
+            # Could not find element for this plan step after retries — skip to next step
+            plan_steps = session.get("plan_steps") or []
+            next_idx = session.get("current_plan_step", 0) + 1
+            if next_idx < len(plan_steps):
+                session["current_plan_step"] = next_idx
+                session.get("plan_search_attempts", {}).pop(str(next_idx), None)
+                # Record a skip result
+                session.setdefault("step_results", []).append({
+                    "step_index": int(step_index) + 1,
+                    "step": current_step,
+                    "passed": False,
+                    "reason": "Could not find matching UI element — skipped",
+                })
+                return {
+                    "action": "scroll",
+                    "direction": "down",
+                    "reason": f"skipped unreachable step, moving to: {plan_steps[next_idx][:60]}",
+                    "from_plan": True,
+                }
             return None
 
         candidate = self._match_element_to_objective(objective + " " + attachment_context, elements, session)
         if candidate:
             return {"action": "click", "xpath": candidate.get("xpath"), "reason": "heuristic objective match"}
 
-        for element in elements:
-            xpath = element.get("xpath")
-            if element.get("clickable") and xpath and xpath not in session["visited_xpaths"]:
-                return {"action": "click", "xpath": xpath, "reason": "first unseen clickable"}
+        # Only fall back to random clicking if there are NO plan steps at all
+        if not session.get("plan_steps"):
+            for element in elements:
+                xpath = element.get("xpath")
+                if element.get("clickable") and xpath and xpath not in session["visited_xpaths"]:
+                    return {"action": "click", "xpath": xpath, "reason": "first unseen clickable"}
 
         return None
 
@@ -1154,15 +1321,24 @@ class UnifiedChatAgent:
             for e in compact_elements
         )
 
+        # Build focused context: current step + next few steps rather than raw plan text
+        step_context = ""
+        plan_steps = session.get("plan_steps") or []
+        step_idx = session.get("current_plan_step", 0)
+        if plan_steps:
+            nearby = plan_steps[max(0, step_idx):step_idx + 5]
+            step_context = "\nUpcoming steps:\n" + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(nearby))
+
         prompt = (
             "You are controlling a mobile app. Look at the screen elements and tell me "
             "what you would do next to accomplish the goal.\n\n"
-            + (f"Current test step: {current_plan_step}\n" if current_plan_step else "")
+            + (f"CURRENT test step to execute: {current_plan_step}\n" if current_plan_step else "")
             + f"Goal: {objective}\n"
-            + (f"\nTest plan:\n{attachment_context[:600]}\n" if attachment_context else "")
+            + step_context
             + f"\nScreen elements:\n{elements_text}\n\n"
-            "Tell me which element to click (by its number), or if I should scroll or go back. "
-            "Explain your reasoning briefly."
+            "Pick the element whose text or id best matches the current test step. "
+            "Reply with the element number to click, or say 'scroll down/up' or 'go back'. "
+            "Explain briefly."
         )
 
         response = self._run_model_prompt(prompt, model, max_tokens=200)
@@ -1356,6 +1532,7 @@ class UnifiedChatAgent:
             return marker.strip(" :")
 
         lowered = context_text.lower()
+        # Multi-TC format: collect steps from ALL **Steps**: sections (PR test plans have many TCs)
         if "**steps**" in lowered or "steps:" in lowered:
             steps = []
             in_steps_section = False
@@ -1369,6 +1546,7 @@ class UnifiedChatAgent:
                     continue
                 if in_steps_section and (marker.startswith("expected") or marker.startswith("db validation") or marker.startswith("preconditions")):
                     in_steps_section = False
+                    # DON'T break — continue to find next TC's Steps section
                     continue
                 if not in_steps_section:
                     continue
@@ -1378,7 +1556,7 @@ class UnifiedChatAgent:
                     if cleaned and self._is_actionable_step(cleaned):
                         steps.append(cleaned)
             if steps:
-                return self._dedupe_steps(steps)[:30]
+                return self._dedupe_steps(steps)[:50]
 
         steps = []
         for line in context_text.splitlines():
@@ -1392,7 +1570,7 @@ class UnifiedChatAgent:
                 cleaned = self._normalize_step_text(cleaned)
                 if cleaned and self._is_actionable_step(cleaned):
                     steps.append(cleaned)
-        return self._dedupe_steps(steps)[:20]
+        return self._dedupe_steps(steps)[:50]
 
     def _extract_expected_outcomes(self, context_text: str) -> List[str]:
         if not context_text:
@@ -1573,20 +1751,15 @@ class UnifiedChatAgent:
                     break
             return {"decision": decision, "explanation": explanation or response.strip()}
 
-        # Fallback: stop with a template message
-        return {
-            "decision": "stop",
-            "explanation": (
-                f"I ran step **\"{step_text}\"** but the expected outcome wasn't met.\n\n"
-                f"**Expected:** {expected_outcome}\n"
-                f"**What I saw:** {failure_reason}\n\n"
-                "This could mean:\n"
-                "- The app feature isn't enabled for this user/account\n"
-                "- A configuration or data setup is missing\n"
-                "- The screen didn't load correctly\n\n"
-                "Would you like me to **retry this step**, **skip and continue**, or do you need to adjust something first?"
-            ),
-        }
+        # Retry with simpler prompt
+        retry_prompt = (
+            f"Step '{step_text}' failed. Expected: '{expected_outcome}'. Got: '{failure_reason}'. "
+            f"Should I retry, skip, or stop? Default to retry. Explain briefly."
+        )
+        retry = self._run_model_prompt(retry_prompt, session.get("model"), max_tokens=100)
+        if retry:
+            return {"decision": "retry", "explanation": retry.strip()}
+        return {"decision": "retry", "explanation": f"Step didn't pass validation — retrying automatically."}
 
     def _llm_explain_skip_codegen(self, session: Dict, failed_steps: List[Dict]) -> str:
         """Let LLM explain why test generation was skipped due to failed steps."""
@@ -1608,14 +1781,15 @@ class UnifiedChatAgent:
         if response:
             return response.strip()
 
-        # Fallback
-        summary = "**I'm holding off on generating test code** because some steps didn't pass validation:\n"
-        for r in failed_steps:
-            summary += f"\n❌ **Step {r.get('step_index')}**: Expected \"{r.get('expected')}\" — {r.get('reason', '')}"
-        summary += "\n\nGenerating tests from failed steps would produce unreliable code. "
-        summary += "Please check the app state/configuration and say **retry** when ready, "
-        summary += "or say **generate anyway** if you want tests regardless."
-        return summary
+        # Retry with simpler prompt
+        retry_prompt = (
+            f"These test steps failed: {failures_text}\n"
+            "Explain briefly why code generation is skipped and what the user should check."
+        )
+        retry = self._run_model_prompt(retry_prompt, session.get("model"), max_tokens=200)
+        if retry:
+            return retry.strip()
+        return f"Some steps failed validation — holding off on code gen until they pass. Say 'retry' when ready."
 
     def _dedupe_steps(self, steps: List[str]) -> List[str]:
         deduped: List[str] = []
@@ -1635,10 +1809,373 @@ class UnifiedChatAgent:
 
     def _is_actionable_step(self, step: str) -> bool:
         lower = step.lower()
-        if "=" in lower and not any(k in lower for k in ["click", "tap", "open", "select", "enter", "start", "place", "login", "search", "menu"]):
+        if "=" in lower and not any(k in lower for k in ["click", "tap", "open", "select", "enter", "start", "place", "login", "search", "menu", "navigate", "verify", "perform"]):
             return False
-        action_words = ["click", "tap", "open", "select", "enter", "start", "place", "login", "search", "menu", "hamburger", "call", "order"]
+        # Filter out generic template filler that can't map to real UI actions
+        if self._is_generic_template_step(step):
+            return False
+        action_words = [
+            "click", "tap", "open", "select", "enter", "start", "place", "login",
+            "search", "menu", "hamburger", "call", "order",
+            "navigate", "go to", "verify", "check", "perform", "observe",
+            "scroll", "swipe", "press", "type", "input", "submit",
+            "confirm", "validate", "launch", "switch", "toggle", "drag",
+            "long press", "double tap", "pinch", "zoom", "back", "close",
+            "dismiss", "accept", "deny", "allow", "interact", "trigger",
+            "wait", "refresh", "pull", "expand", "collapse",
+        ]
         return any(word in lower for word in action_words)
+
+    def _is_verification_only_step(self, step: str) -> bool:
+        """Check if a step is purely an assertion/verification — not a UI interaction.
+        These steps should be auto-passed by reading the screen, not by scroll-hunting."""
+        lower = step.lower()
+        # Steps that start with verify/check/observe/validate/confirm that don't mention
+        # a concrete UI action (tap, click, enter, etc.) are verification-only
+        verify_starters = ["verify", "check", "observe", "validate", "confirm", "ensure"]
+        if not any(lower.startswith(v) for v in verify_starters):
+            return False
+        # If it also mentions a concrete interaction, it's not verification-only
+        interaction_words = ["click", "tap", "enter", "type", "input", "press",
+                            "select", "scroll", "swipe", "submit", "toggle"]
+        if any(w in lower for w in interaction_words):
+            return False
+        return True
+
+    def _is_generic_template_step(self, step: str) -> bool:
+        """Detect boilerplate/template steps that can't map to real UI elements."""
+        lower = step.lower()
+        generic_patterns = [
+            "perform the primary interaction with the element",
+            "verify the element still responds correctly",
+            "verify the element functions correctly",
+            "perform an action that triggers a state change",
+            "verify the ui updates to reflect the new state",
+            "identify the navigation trigger on the source screen",
+            "perform the action that triggers navigation",
+            "wait for the destination screen to load",
+            "wait for the transition to complete",
+            "locate the interactive element on the screen",
+            "perform the user input action",
+            "verify no regression in element behavior",
+            "the state change is reflected",
+            "the ui updates reactively",
+            "the state value is consistent",
+            "navigate to the screen with the state variable",
+            "wait for the application to process the input",
+            "wait for the application to process",
+            "navigate to the screen with the state",
+            "observe the initial state value",
+        ]
+        return any(pat in lower for pat in generic_patterns)
+
+    def _handle_analyze_pr(
+        self,
+        intent: Dict,
+        session: Dict,
+        user_message: str,
+        workspace_path: str,
+        send_progress: Callable,
+        sid: str,
+        device_name: str,
+        app_package: str,
+        app_activity: str,
+        attachment_context: str,
+    ) -> Dict:
+        """Analyze a Bugzilla bug or Bitbucket PR and generate test plan, optionally execute it."""
+        import asyncio
+        import sys
+
+        pr_url = intent.get("pr_url", "")
+        chain_execute = intent.get("chain_execute", False)
+
+        # Extract URL from user message if not in intent
+        if not pr_url:
+            import re as _re
+            bugzilla_match = _re.search(r'https://bugzilla\.[^\s]+show_bug\.cgi\?id=\d+', user_message)
+            bitbucket_match = _re.search(r'https://bitbucket\.org/[^\s]+/pull-requests/\d+', user_message)
+            url_match = bugzilla_match or bitbucket_match
+            if url_match:
+                pr_url = url_match.group(0)
+
+        if not pr_url:
+            send_progress("warning", "⚠️ No Bugzilla or Bitbucket PR URL found in your message.")
+            response = "I couldn't find a Bugzilla or Bitbucket PR link in your message. Paste a URL like:\n\n" \
+                       "- `https://bugzilla.bizom.in/show_bug.cgi?id=153576`\n" \
+                       "- `https://bitbucket.org/bizom/bizom-kmm/pull-requests/6796`\n\n" \
+                       "I'll analyze the code changes and generate a test plan from them."
+            send_progress("chat_response", response)
+            return {"success": False, "type": "analyze_pr", "message": response, "session_id": sid, "state": self._session_state(session)}
+
+        is_bugzilla = "bugzilla" in pr_url
+        source_label = "Bugzilla bug" if is_bugzilla else "Bitbucket PR"
+        send_progress("progress", f"🔍 Analyzing {source_label}: {pr_url}")
+
+        # ── Setup: add pr-review to path, configure env, resolve output dir ──
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pr_review_src = os.path.join(project_root, "codebaseexplorer", "pr-review", "src")
+        pr_review_root = os.path.join(project_root, "codebaseexplorer", "pr-review")
+        for p in [pr_review_src, pr_review_root]:
+            if p not in sys.path:
+                sys.path.insert(0, p)
+
+        # Resolve output to workspace test_plans dir (not relative ./output)
+        output_dir = os.path.join(workspace_path or project_root, "test_plans", "pr_analysis")
+        os.makedirs(output_dir, exist_ok=True)
+        os.environ["OUTPUT_DIR"] = output_dir
+
+        # Load pr-review's .env for Bitbucket creds if not already in environment
+        # Single source of truth: main project .env
+        main_env = os.path.join(project_root, ".env")
+        os.environ["BITBUCKET_MCP_ENV_FILE"] = main_env
+
+        try:
+            from pr_test_generator.settings import Settings, _load_env_file
+            from pr_test_generator.bitbucket_client import BitbucketClient
+            from pr_test_generator.analyzer import PRAnalyzer
+
+            # Load env gracefully — no sys.exit on missing creds
+            _load_env_file()
+            email = os.environ.get("BITBUCKET_EMAIL", "").strip()
+            api_token = os.environ.get("BITBUCKET_API_TOKEN", "").strip()
+            if not email or not api_token:
+                missing = []
+                if not email:
+                    missing.append("BITBUCKET_EMAIL")
+                if not api_token:
+                    missing.append("BITBUCKET_API_TOKEN")
+                response = (
+                    f"I need Bitbucket credentials to analyze PRs. Missing: **{', '.join(missing)}**\n\n"
+                    "Add them to your `.env` file:\n```\n"
+                    "BITBUCKET_EMAIL=your.email@company.com\n"
+                    "BITBUCKET_API_TOKEN=your_app_password\n```\n\n"
+                    "Then restart the backend and try again."
+                )
+                send_progress("chat_response", response)
+                return {"success": False, "type": "analyze_pr", "message": response, "session_id": sid, "state": self._session_state(session)}
+
+            bugzilla_api_key = os.environ.get("BUGZILLA_API_KEY", "").strip()
+            from pathlib import Path as _Path
+            settings = Settings(
+                email=email,
+                api_token=api_token,
+                output_dir=_Path(output_dir),
+                bugzilla_api_key=bugzilla_api_key,
+            )
+
+            async def _run_analysis():
+                async with BitbucketClient(settings) as client:
+                    analyzer = PRAnalyzer(client, settings)
+                    return await analyzer.analyze(pr_url)
+
+            send_progress("progress", f"📡 Fetching PR details and code changes...")
+            # Run the async analyzer
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor() as pool:
+                        output_path = pool.submit(lambda: asyncio.run(_run_analysis())).result(timeout=120)
+                else:
+                    output_path = loop.run_until_complete(_run_analysis())
+            except RuntimeError:
+                output_path = asyncio.run(_run_analysis())
+
+            output_path_str = str(output_path)
+            send_progress("success", f"✅ Test plan generated: {os.path.basename(output_path_str)}")
+
+            # Read the generated test plan
+            test_plan_content = ""
+            try:
+                with open(output_path_str, "r", encoding="utf-8") as f:
+                    test_plan_content = f.read()
+            except Exception as e:
+                send_progress("warning", f"⚠️ Could not read generated file: {e}")
+
+            # Also check for locators JSON
+            locators_json_path = output_path_str.replace("-test-cases.md", "-locators.json")
+            locators_data = None
+            if os.path.isfile(locators_json_path):
+                try:
+                    with open(locators_json_path, "r") as f:
+                        locators_data = json.load(f)
+                    locator_count = len(locators_data.get("locators", []))
+                    send_progress("success", f"📍 Found {locator_count} locators from code changes")
+                except Exception:
+                    pass
+
+            # Check for change summary
+            summary_path = output_path_str.replace("-test-cases.md", "-change-summary.md")
+            change_summary = ""
+            if os.path.isfile(summary_path):
+                try:
+                    with open(summary_path, "r") as f:
+                        change_summary = f.read()[:1000]
+                except Exception:
+                    pass
+
+            # Build conversational response
+            test_case_count = test_plan_content.count("#### TC")
+            wrap_prompt = (
+                f"I just analyzed a {source_label} and generated a test plan from the code changes.\n\n"
+                f"URL: {pr_url}\n"
+                f"Generated: {test_case_count} test cases\n"
+                f"Output file: {os.path.basename(output_path_str)}\n"
+                + (f"Code changes summary: {change_summary[:300]}\n" if change_summary else "")
+                + (f"Locators detected: {len(locators_data.get('locators', []))}\n" if locators_data else "")
+                + "\nTell the user what you found in a natural, engaging way. "
+                "Mention the number of test cases, what areas they cover, and ask if they want to "
+                "execute these tests on the connected emulator and generate Java/Maven test code."
+            )
+            response = self._run_model_prompt(wrap_prompt, session.get("model"), max_tokens=400)
+            if not response:
+                response = (
+                    f"I analyzed the {source_label} and generated **{test_case_count} test cases** "
+                    f"from the code changes.\n\n"
+                    f"📄 Test plan saved to: `{os.path.basename(output_path_str)}`\n"
+                    + (f"📍 Detected **{len(locators_data.get('locators', []))}** locators from the diff\n" if locators_data else "")
+                    + "\nWant me to execute these tests on the emulator and generate Java Maven test code?"
+                )
+            else:
+                response = response.strip()
+
+            send_progress("chat_response", response)
+
+            # If user also wants execution, chain into navigate_and_generate
+            if chain_execute:
+                send_progress("progress", "🔗 Chaining into app execution + code generation...")
+
+                # Load the generated test plan as plan steps
+                plan_steps = self._extract_plan_steps(test_plan_content)
+                if plan_steps:
+                    session["plan_steps"] = plan_steps
+                    session["current_plan_step"] = 0
+                    session["plan_search_attempts"] = {}
+                    session["step_results"] = []
+                    send_progress("progress", f"🗺️ Loaded {len(plan_steps)} test steps from PR analysis")
+
+                    expected_outcomes = self._extract_expected_outcomes(test_plan_content)
+                    session["expected_outcomes"] = expected_outcomes
+
+                # Connect and execute
+                send_progress("progress", "🔌 Connecting to device...")
+                connection = self._connect_device_mcp(device_name, app_package, app_activity)
+                if not connection.get("success"):
+                    connect_error = connection.get("error") or "Failed to connect"
+                    send_progress("warning", f"⚠️ Device connect failed: {connect_error}")
+                    return {
+                        "success": True,
+                        "type": "analyze_pr",
+                        "message": response + f"\n\n⚠️ Couldn't connect to device for execution: {connect_error}",
+                        "test_plan_path": output_path_str,
+                        "session_id": sid,
+                        "state": self._session_state(session),
+                    }
+
+                send_progress("success", f"✅ Connected to {device_name}")
+
+                # Run the agent loop
+                max_steps = intent.get("max_steps", self._steps_for_agent_type(session.get("agent_type", "balanced")))
+                if plan_steps:
+                    max_steps = min(80, max(max_steps, len(plan_steps) * 3))
+
+                exploration = self._run_agent_loop(
+                    session=session,
+                    user_message=user_message,
+                    workspace_path=workspace_path,
+                    send_progress=send_progress,
+                    max_steps=max_steps,
+                    attachment_context=test_plan_content[:6000],
+                )
+
+                # Generate code
+                generation = self._generate_tests_from_locators(
+                    session=session,
+                    user_message=user_message,
+                    workspace_path=workspace_path,
+                    send_progress=send_progress,
+                    framework=intent.get("framework", "Appium"),
+                    language=intent.get("language", "Java"),
+                    structure=intent.get("structure", "Maven POM"),
+                    context_text=test_plan_content[:2000],
+                )
+
+                # Final wrap-up
+                gen_success = generation.get("success", False)
+                gen_result = generation.get("result", {}) if isinstance(generation.get("result"), dict) else {}
+                saved_files = gen_result.get("saved_files", [])
+
+                final_prompt = (
+                    f"I just completed an end-to-end QA automation run:\n\n"
+                    f"1. Analyzed {source_label}: {pr_url}\n"
+                    f"2. Generated {test_case_count} test cases from code changes\n"
+                    f"3. Executed {exploration.get('steps_executed', 0)} actions on the emulator\n"
+                    f"4. Collected {exploration.get('locators_collected', 0)} locators\n"
+                    f"5. Code generation: {'succeeded' if gen_success else 'failed'}"
+                    + (f", created {len(saved_files)} files" if saved_files else "")
+                    + "\n\nGive a natural, engaging wrap-up. Mention the full pipeline from bug/PR to test code."
+                )
+                final_message = self._run_model_prompt(final_prompt, session.get("model"), max_tokens=400)
+                if not final_message:
+                    final_message = response
+
+                return {
+                    "success": True,
+                    "type": "analyze_pr",
+                    "exploration": exploration,
+                    "generation": generation,
+                    "test_plan_path": output_path_str,
+                    "message": final_message.strip(),
+                    "session_id": sid,
+                    "state": self._session_state(session),
+                }
+
+            # No chaining — just return the analysis result
+            return {
+                "success": True,
+                "type": "analyze_pr",
+                "test_plan_path": output_path_str,
+                "test_case_count": test_case_count,
+                "message": response,
+                "session_id": sid,
+                "state": self._session_state(session),
+            }
+
+        except Exception as exc:
+            import traceback
+            error_detail = str(exc)
+            send_progress("error", f"❌ PR analysis failed: {error_detail}")
+
+            # Check for common issues
+            if "BITBUCKET_EMAIL" in error_detail or "BITBUCKET_API_TOKEN" in error_detail:
+                response = (
+                    "I need Bitbucket credentials to analyze PRs. Add these to your `.env` file:\n\n"
+                    "```\nBITBUCKET_EMAIL=your.email@company.com\n"
+                    "BITBUCKET_API_TOKEN=your_app_password\n```\n\n"
+                    "Then restart the backend."
+                )
+            elif "BUGZILLA_API_KEY" in error_detail:
+                response = (
+                    "I need a Bugzilla API key to resolve bug URLs. Add to your `.env`:\n\n"
+                    "```\nBUGZILLA_API_KEY=your_api_key\n```\n\n"
+                    "Then restart the backend."
+                )
+            else:
+                response = (
+                    f"PR analysis hit an issue: **{error_detail}**\n\n"
+                    "This could be a network issue, invalid URL, or missing credentials. "
+                    "Check the URL and try again."
+                )
+
+            send_progress("chat_response", response)
+            return {
+                "success": False,
+                "type": "analyze_pr",
+                "error": error_detail,
+                "message": response,
+                "session_id": sid,
+                "state": self._session_state(session),
+            }
 
     def _generate_tests_from_locators(
         self,
@@ -1804,14 +2341,22 @@ class UnifiedChatAgent:
             return "Page Object Model"
         return "Maven POM"
 
-    def _help_text(self) -> str:
+    def _help_text(self, session: Dict = None) -> str:
+        system = (
+            "You are a QA automation copilot. Someone just said 'help'. "
+            "Tell them what you can do like a friend would — casual, quick, no formal structure. "
+            "Never use bullet points. Give 2 example prompts they could try, embedded naturally in your response."
+        )
+        messages = [{"role": "user", "content": "help"}]
+        model = session.get("model") if session else None
+        response = self._run_chat_prompt(system, messages, model, max_tokens=300, temperature=0.7)
+        if response:
+            return response.strip()
+        # Only if LLM is completely down
         return (
-            "I'm your QA automation copilot. Here's what I can do:\n\n"
-            "- **Explore the app** — I'll connect to your device and scan the screen\n"
-            "- **Execute flows** — Tell me a goal like \"do the login flow\" and I'll navigate step by step\n"
-            "- **Generate tests** — I can create Appium Java test cases from the screens I've explored\n"
-            "- **Continue** — Just say \"continue\" to pick up where we left off\n\n"
-            "Try something like: *\"Connect to the device and explore the home screen\"*"
+            "Hey! I'm your QA copilot. I can explore your app, run test flows on the emulator, "
+            "generate Java test code, and even analyze Bugzilla bugs or Bitbucket PRs end-to-end. "
+            "Try something like: *'Analyze https://bugzilla.bizom.in/show_bug.cgi?id=153576 and execute tests'*"
         )
 
     def _post_navigation_response(self, session: Dict, user_message: str, exploration: Dict) -> str:
@@ -1829,111 +2374,291 @@ class UnifiedChatAgent:
         if final_by_step:
             passed = sum(1 for r in final_by_step.values() if r.get("passed"))
             failed = sum(1 for r in final_by_step.values() if not r.get("passed"))
-            step_summary = f"\nOut of {len(final_by_step)} test steps: {passed} passed, {failed} failed."
+            step_summary = f"\nResults: {passed} passed, {failed} failed out of {len(final_by_step)} steps."
             for idx in sorted(final_by_step.keys()):
                 r = final_by_step[idx]
                 status = "passed" if r.get("passed") else "failed"
                 step_summary += f"\n- Step {idx}: {status} — {r.get('reason', '')}"
 
-        prompt = (
-            f"I just finished running through the app for the user. Tell them how it went — "
-            f"be natural, like you're chatting with a colleague.\n\n"
-            f"What they asked: {user_message}\n"
-            f"What I did: Performed {steps} action(s) on the app, captured {locators} locator(s)"
-            + (f", saved them to {file_name}" if file_name else "")
-            + "."
-            + step_summary
-            + "\n\nGive a quick, friendly summary (3-5 sentences). "
-            "Mention what passed, what failed if anything, and what's next."
+        system = (
+            "You just finished running through a mobile app for a tester. "
+            "Give them a quick summary like a colleague would — casual, direct. "
+            "No bullet points unless there are many steps to report. "
+            "Mention what worked, what didn't, and suggest the logical next step."
         )
-        response = self._run_model_prompt(prompt, session.get("model"), max_tokens=300)
+        facts = (
+            f"Performed {steps} action(s), captured {locators} locator(s)"
+            + (f", saved to {file_name}" if file_name else "")
+            + "." + step_summary
+        )
+        messages = [
+            {"role": "user", "content": user_message},
+            {"role": "user", "content": f"[Results: {facts}]"}
+        ]
+        response = self._run_chat_prompt(system, messages, session.get("model"), max_tokens=400, temperature=0.7)
         if response:
             return response.strip()
 
-        # Fallback template
-        summary = f"All done! I went through **{steps}** actions on the app and picked up **{locators}** locators"
-        summary += f" (saved to `{file_name}`)" if file_name else ""
-        summary += "."
-        if final_by_step:
-            passed = sum(1 for r in final_by_step.values() if r.get("passed"))
-            failed = sum(1 for r in final_by_step.values() if not r.get("passed"))
-            summary += f"\n\n**Results:** {passed} passed, {failed} failed."
-            for idx in sorted(final_by_step.keys()):
-                r = final_by_step[idx]
-                icon = "✅" if r.get("passed") else "❌"
-                summary += f"\n{icon} Step {idx}: {r.get('reason', 'no details')}"
-            if failed > 0:
-                summary += "\n\nA few steps didn't go as expected — might want to check the app state or data setup."
-        else:
-            summary += "\n\nWant me to keep exploring, or should I generate test cases from what I've got?"
-        return summary
+        # Fallback single-shot
+        simple = f"I ran {steps} actions and collected {locators} locators." + step_summary + "\nSummarize naturally."
+        retry = self._run_model_prompt(simple, session.get("model"), max_tokens=200, temperature=0.7)
+        if retry:
+            return retry.strip()
+        return f"Done! Ran {steps} actions, collected {locators} locators." + step_summary
 
     def _conversational_wrap(self, facts: str, user_message: str, session: Dict) -> Optional[str]:
-        """Use the LLM to rewrite dry facts into a natural copilot response."""
-        prompt = (
-            f"Hey, the user said: \"{user_message}\"\n\n"
-            f"Here's what I know: {facts}\n\n"
-            "Turn this into a natural, friendly response — like you're chatting with them. "
-            "Keep it short (3-5 sentences), be direct, and suggest what to do next."
+        """Use multi-turn chat to rewrite dry facts into a natural response."""
+        system = (
+            "You're a QA copilot. Take the facts below and turn them into a casual, "
+            "human response. No bullet points. 2-4 sentences max."
         )
-        response = self._run_model_prompt(prompt, session.get("model"), max_tokens=200)
+        messages = [
+            {"role": "user", "content": user_message},
+            {"role": "user", "content": f"[Facts to communicate: {facts}]"},
+        ]
+        response = self._run_chat_prompt(system, messages, session.get("model"), max_tokens=200, temperature=0.7)
         return response.strip() if response else None
 
     def _dynamic_chat_response(self, user_message: str, session: Dict, attachment_context: str) -> str:
-        prompt = self._build_chat_prompt(user_message, session, attachment_context)
-        response = self._run_model_prompt(prompt, session.get("model"), max_tokens=350)
+        system, messages = self._build_chat_messages(user_message, session, attachment_context)
+        response = self._run_chat_prompt(system, messages, session.get("model"), max_tokens=500, temperature=0.7)
         if response:
             return response.strip()
 
+        # Fallback: single-shot with personality baked in
+        fallback_prompt = (
+            "You're a chill QA copilot. The user said: \"" + user_message + "\". "
+            + (f"You were working on: {session.get('last_objective', '')}. " if session.get('last_objective') else "")
+            + "Reply casually in 2-3 sentences. Suggest what to do next."
+        )
+        retry = self._run_model_prompt(fallback_prompt, session.get("model"), max_tokens=200, temperature=0.7)
+        if retry:
+            return retry.strip()
+        return "What's up? Tell me what you need and I'll get on it."
+
+    def _build_chat_messages(self, user_message: str, session: Dict, attachment_context: str) -> tuple:
+        """Return (system_instruction, messages) for multi-turn chat — like how Claude/ChatGPT work."""
+        system = (
+            "You are a QA automation copilot embedded in VS Code. You talk like a sharp, "
+            "friendly senior engineer — not a help desk, not a chatbot, not a documentation page. "
+            "Think of how a smart colleague on Slack would reply.\n\n"
+            "Personality rules:\n"
+            "- Match the user's energy. Short message? Short reply. Detailed question? Go deeper.\n"
+            "- Never use bullet points or numbered lists unless the user asks for a list.\n"
+            "- Never start with 'I understand', 'Great question', 'Sure!', or 'Absolutely!'.\n"
+            "- Never repeat the user's question back to them.\n"
+            "- If it's a yes/no question, start with yes or no.\n"
+            "- Suggest ONE clear next thing to do, not a menu of 5 options.\n"
+            "- Use casual language. Contractions. Short sentences when appropriate.\n"
+            "- You can be opinionated — recommend the best approach, don't list all approaches.\n"
+            "- Max 4 sentences for casual chat. Only go longer if explaining something technical.\n\n"
+            "Your capabilities (mention only when relevant):\n"
+            "- Connect to Android emulators and explore app screens\n"
+            "- Execute test flows by navigating the app step by step\n"
+            "- Generate Appium Java Maven test code from captured locators\n"
+            "- Analyze Bugzilla bugs or Bitbucket PRs → generate test plans → execute on emulator → generate code (full pipeline)\n"
+        )
+
+        # Add current state to system prompt so the model has context
+        state_parts = []
         if session.get("last_objective"):
-            return (
-                f"Got it. We were working on: *{session.get('last_objective')}*.\n\n"
-                "I can pick up from the current screen, or you can give me a new task."
-            )
-        return (
-            "Tell me what you'd like to do — for example, *\"explore the home screen\"* or "
-            "*\"run the login flow and generate tests\"*. I'll handle it step by step."
-        )
+            state_parts.append(f"Currently working on: {session['last_objective']}")
+        plan_steps = session.get("plan_steps", [])
+        if plan_steps:
+            state_parts.append(f"Test plan loaded: {len(plan_steps)} steps, on step {session.get('current_plan_step', 0) + 1}")
+        if session.get("locators_file"):
+            state_parts.append("Locators have been collected from the app")
+        if state_parts:
+            system += "\nCurrent state: " + ". ".join(state_parts) + ".\n"
 
-    def _build_chat_prompt(self, user_message: str, session: Dict, attachment_context: str) -> str:
-        history_lines = []
-        for item in session.get("history", [])[-6:]:
-            history_lines.append(f"{item.get('role', 'user')}: {item.get('content', '')}")
+        # Build proper conversation turns from history
+        messages = []
+        for item in session.get("history", [])[-8:]:
+            role = item.get("role", "user")
+            content = item.get("content", "")
+            # Skip internal JSON summaries — they're not conversation
+            if content.startswith("{") and content.endswith("}"):
+                continue
+            if not content.strip():
+                continue
+            # Truncate very long messages but keep enough for context
+            if len(content) > 500:
+                content = content[:500] + "..."
+            if role not in ("user", "assistant"):
+                role = "user"
+            messages.append({"role": role, "content": content})
 
-        return (
-            "You're a QA automation copilot chatting with a tester in VS Code. "
-            "Talk naturally — like a helpful colleague, not a robot.\n"
-            "Be direct, confident, and specific. If you're blocked, say so honestly.\n"
-            "Keep replies short (4-8 lines). Suggest concrete next steps.\n\n"
-            f"What we're working on: {session.get('last_objective', 'nothing yet')}\n"
-            f"Agent mode: {session.get('agent_type')}\n"
-            "Recent conversation:\n"
-            + "\n".join(history_lines)
-            + "\n"
-            + (f"Attachment context:\n{attachment_context}\n" if attachment_context else "")
-            + f"Current user message: {user_message}\n"
-            + "Respond in this structure:\n"
-            + "1) Understanding\n"
-            + "2) What I can do now\n"
-            + "3) Best next command/message to send"
-        )
+        # Current message — include attachment context inline if present
+        current_msg = user_message
+        if attachment_context:
+            current_msg += f"\n\n[Attached context: {attachment_context[:600]}]"
 
-    def _run_model_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300) -> Optional[str]:
+        messages.append({"role": "user", "content": current_msg})
+
+        return system, messages
+
+    def _run_model_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300, temperature: float = 0.5) -> Optional[str]:
         # Always try Gemini first — it's the primary LLM
         if self.has_gemini:
-            response = self._run_gemini_prompt(prompt, model, max_tokens=max_tokens)
+            response = self._run_gemini_prompt(prompt, model, max_tokens=max_tokens, temperature=temperature)
             if response:
                 return response
 
         # Claude as secondary
         if self.has_anthropic:
-            response = self._run_claude_prompt(prompt, model, max_tokens=max_tokens)
+            response = self._run_claude_prompt(prompt, model, max_tokens=max_tokens, temperature=temperature)
             if response:
                 return response
 
         return None
 
-    def _run_gemini_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300) -> Optional[str]:
+    # ── Multi-turn chat API — this is what makes responses feel human ──
+    # System instruction is separated from conversation history, just like
+    # how Claude and ChatGPT actually work. Single-shot prompts can't do this.
+
+    def _run_chat_prompt(self, system: str, messages: List[Dict], model: Optional[str],
+                         max_tokens: int = 500, temperature: float = 0.7) -> Optional[str]:
+        """Run a proper multi-turn conversation with system instruction separated from history.
+        messages: [{"role": "user"|"assistant", "content": "..."}]
+        """
+        if self.has_gemini:
+            response = self._run_gemini_chat(system, messages, model, max_tokens, temperature)
+            if response:
+                return response
+        if self.has_anthropic:
+            response = self._run_claude_chat(system, messages, model, max_tokens, temperature)
+            if response:
+                return response
+        return None
+
+    def _run_gemini_chat(self, system: str, messages: List[Dict], model: Optional[str],
+                         max_tokens: int, temperature: float) -> Optional[str]:
+        if not self.has_gemini:
+            return None
+
+        selected_model = model or "gemini-3-flash-preview"
+        aliases = {
+            "gemini-pro": "gemini-1.5-pro",
+            "gemini-flash": "gemini-3-flash-preview",
+            "gemini-2.0-flash": "gemini-3-flash-preview",
+            "gemini-2.0-flash-lite": "gemini-3-flash-preview",
+        }
+        selected_model = aliases.get(selected_model, selected_model)
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{selected_model}:generateContent"
+
+        # Build proper multi-turn contents — Gemini uses "user" and "model" roles
+        contents = []
+        for msg in messages:
+            role = "user" if msg.get("role") == "user" else "model"
+            text = msg.get("content", "")
+            if text:
+                contents.append({"role": role, "parts": [{"text": text}]})
+
+        # Gemini requires alternating roles — merge consecutive same-role messages
+        merged = []
+        for turn in contents:
+            if merged and merged[-1]["role"] == turn["role"]:
+                merged[-1]["parts"][0]["text"] += "\n" + turn["parts"][0]["text"]
+            else:
+                merged.append(turn)
+        # Must start with "user" and end with "user"
+        if merged and merged[0]["role"] != "user":
+            merged.insert(0, {"role": "user", "parts": [{"text": "(conversation start)"}]})
+        if not merged:
+            merged = [{"role": "user", "parts": [{"text": "(no message)"}]}]
+
+        payload = {
+            "systemInstruction": {"parts": [{"text": system}]},
+            "contents": merged,
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+
+        try:
+            response = requests.post(
+                url, params={"key": self.gemini_api_key}, json=payload, timeout=20,
+            )
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    text = "\n".join(part.get("text", "") for part in parts if part.get("text"))
+                    return text.strip() if text else None
+            else:
+                import logging
+                logging.warning(f"Gemini chat API error {response.status_code}: {response.text[:200]}")
+        except Exception as e:
+            import logging
+            logging.warning(f"Gemini chat API exception: {e}")
+        return None
+
+    def _run_claude_chat(self, system: str, messages: List[Dict], model: Optional[str],
+                         max_tokens: int, temperature: float) -> Optional[str]:
+        if not self.has_anthropic:
+            return None
+
+        selected_model = model or "claude-3-5-sonnet-latest"
+        aliases = {
+            "claude-sonnet": "claude-3-5-sonnet-latest",
+            "claude-haiku": "claude-3-5-haiku-latest",
+        }
+        selected_model = aliases.get(selected_model, selected_model)
+
+        # Claude supports system as a top-level field + proper multi-turn messages
+        api_messages = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            if role not in ("user", "assistant"):
+                role = "user"
+            content = msg.get("content", "")
+            if content:
+                api_messages.append({"role": role, "content": content})
+        # Claude requires alternating roles — merge consecutive same-role
+        merged = []
+        for msg in api_messages:
+            if merged and merged[-1]["role"] == msg["role"]:
+                merged[-1]["content"] += "\n" + msg["content"]
+            else:
+                merged.append(msg)
+        if not merged:
+            merged = [{"role": "user", "content": "(no message)"}]
+        if merged[0]["role"] != "user":
+            merged.insert(0, {"role": "user", "content": "(conversation start)"})
+
+        try:
+            response = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": self.anthropic_api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": selected_model,
+                    "system": system,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "messages": merged,
+                },
+                timeout=20,
+            )
+            if response.status_code == 200:
+                payload = response.json()
+                parts = payload.get("content", [])
+                text = "\n".join(
+                    part.get("text", "") for part in parts
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+                return text.strip() if text else None
+        except Exception:
+            return None
+        return None
+
+    def _run_gemini_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300, temperature: float = 0.5) -> Optional[str]:
         if not self.has_gemini:
             return None
 
@@ -1950,7 +2675,7 @@ class UnifiedChatAgent:
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": temperature,
                 "maxOutputTokens": max_tokens,
             },
         }
@@ -2006,7 +2731,7 @@ class UnifiedChatAgent:
 
         return None
 
-    def _run_claude_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300) -> Optional[str]:
+    def _run_claude_prompt(self, prompt: str, model: Optional[str], max_tokens: int = 300, temperature: float = 0.5) -> Optional[str]:
         if not self.has_anthropic:
             return None
 
@@ -2028,7 +2753,7 @@ class UnifiedChatAgent:
                 json={
                     "model": selected_model,
                     "max_tokens": max_tokens,
-                    "temperature": 0.2,
+                    "temperature": temperature,
                     "messages": [{"role": "user", "content": prompt}],
                 },
                 timeout=20,
